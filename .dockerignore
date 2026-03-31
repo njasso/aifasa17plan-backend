@@ -1,0 +1,19 @@
+# backend/.dockerignore
+node_modules
+npm-debug.log
+.env
+.env.local
+.env.production
+auth_info
+uploads
+logs
+*.log
+test
+tests
+coverage
+.nyc_output
+.vscode
+.idea
+*.md
+.git
+.gitignore

@@ -1,0 +1,9 @@
+{
+  "watch": ["server.js", "backend"],
+  "ignore": [
+    "auth_info/*",
+    "*.log",
+    "node_modules"
+  ],
+  "ext": "js,json"
+}
