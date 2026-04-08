@@ -131,8 +131,9 @@ const connectDB = async () => {
     console.log(` 🔗 Hôte: ${mongoose.connection.host}`);
 
     schedulerService.start();
-    await whatsappService.init();
-
+whatsappService.init().catch(err => {
+  console.warn('⚠️ WhatsApp non disponible, le serveur continue:', err.message);
+});
   } catch (err) {
     isConnected = false;
     mongoRetryCount++;
@@ -162,6 +163,57 @@ mongoose.connection.on('reconnected', () => {
 });
 
 connectDB();
+
+
+// ============================================================
+// INITIALISATION WHATSAPP (NON BLOQUANT)
+// ============================================================
+// WhatsApp est un service optionnel. Le serveur démarre même si WhatsApp échoue.
+
+const startWhatsApp = async () => {
+  if (process.env.WHATSAPP_ENABLED !== 'true') {
+    logger.info('📵 WhatsApp désactivé dans la configuration (WHATSAPP_ENABLED=false)');
+    return;
+  }
+
+  try {
+    logger.info('🔄 Initialisation WhatsApp en arrière-plan...');
+    const result = await whatsappService.init();
+    
+    if (result?.success) {
+      logger.info('✅ Service WhatsApp initialisé');
+    } else {
+      logger.warn('⚠️ WhatsApp initialisé avec avertissements:', result?.error || 'Inconnu');
+    }
+  } catch (err) {
+    logger.warn('⚠️ WhatsApp non disponible, le serveur continue sans WhatsApp:', err.message);
+  }
+};
+
+// Lancer WhatsApp sans attendre (non bloquant)
+startWhatsApp();
+
+// ============================================================
+// DÉMARRAGE DU SERVEUR HTTP
+// ============================================================
+server.listen(PORT, async () => {
+  const waStatus = await whatsappService.getStatus().catch(() => ({ connected: false }));
+
+  console.log(`
+  🌿 AIFASA 17 API
+  ═══════════════════════════════════════════════════════════════════════
+  🚀 Serveur: http://localhost:${PORT}
+  📊 Health: http://localhost:${PORT}/health
+  📚 Documentation: http://localhost:${PORT}/api/docs
+  🌍 Environnement: ${process.env.NODE_ENV || 'development'}
+  🤖 IA DeepSeek: ${process.env.DEEPSEEK_API_KEY ? '✅ Configurée' : '❌ Non configurée'}
+  📧 Email: ${process.env.SMTP_USER ? '✅ Configuré' : '❌ Non configuré'}
+  💬 WhatsApp: ${waStatus.connected ? `✅ Connecté (${waStatus.user?.name || 'Session'})` : '⏳ En attente de scan QR / Désactivé'}
+  💰 Finances: ✅ Actif (gestion des cotisations, sanctions, caisses)
+  🔌 WebSocket: ✅ Actif
+  ═══════════════════════════════════════════════════════════════════════
+  `);
+});
 
 // Import des routes
 import authRoutes from './routes/auth.js';
