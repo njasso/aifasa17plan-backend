@@ -1,85 +1,284 @@
+// services/whatsappBaileys.js
 import makeWASocket, {
   DisconnectReason,
-  useMultiFileAuthState
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore
 } from "@whiskeysockets/baileys";
 import pino from "pino";
+import { unlinkSync, existsSync } from "fs";
+import path from "path";
 
+// ============================================================
+// 🔥 VARIABLES GLOBALES
+// ============================================================
 let sock = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+let connectionStatus = {
+  connected: false,
+  user: null,
+  retryCount: 0
+};
 
-export const startWhatsApp = async () => {
+// ============================================================
+// 📊 GETTERS
+// ============================================================
+export const getConnectionStatus = () => ({ ...connectionStatus });
+
+export const getReconnectAttempts = () => reconnectAttempts;
+
+export const resetReconnectAttempts = () => {
+  reconnectAttempts = 0;
+};
+
+// ============================================================
+// 🚀 INIT WHATSAPP
+// ============================================================
+export const initWhatsApp = async (onQR, onConnected, onInvalidSession) => {
   try {
+    // Vérifier version Baileys
+    const { version } = await fetchLatestBaileysVersion();
+    console.log(`📦 Baileys version: ${version}`);
+
+    // Auth state
     const { state, saveCreds } = await useMultiFileAuthState("auth");
 
+    // Créer socket
     sock = makeWASocket({
-      auth: state,
-
-      // 🔥 LOG MINIMAL (important pour Render)
+      version,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" }))
+      },
       logger: pino({ level: "silent" }),
-
-      // 🚀 OPTIMISATION IMPORTANTE
+      printQRInTerminal: false,
+      browser: ["AIFASA17", "Chrome", "1.0.0"],
       syncFullHistory: false,
-      markOnlineOnConnect: false,
+      markOnlineOnConnect: true,
+      connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 0,
-
-      // 🔥 empêche sync messages lourds
       shouldSyncHistoryMessage: () => false,
+      generateHighQualityLinkPreview: false,
     });
 
-    // 💾 sauvegarde session
+    // ============================================================
+    // 📡 ÉVÉNEMENTS
+    // ============================================================
+    
+    // Sauvegarde credentials
     sock.ev.on("creds.update", saveCreds);
 
-    // 📡 connexion / reconnexion
-    sock.ev.on("connection.update", (update) => {
-      const { connection, lastDisconnect } = update;
+    // Connexion
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
+      // 📱 QR Code
+      if (qr && onQR) {
+        onQR(qr);
+      }
+
+      // ✅ Connecté
+      if (connection === "open") {
+        reconnectAttempts = 0;
+        connectionStatus.connected = true;
+        connectionStatus.user = {
+          name: sock.user?.name || "WhatsApp User",
+          jid: sock.user?.id?.split(":")[0] + "@s.whatsapp.net"
+        };
+        
+        console.log("✅ WhatsApp connecté !");
+        if (onConnected) onConnected();
+      }
+
+      // ❌ Déconnecté
       if (connection === "close") {
-        const shouldReconnect =
-          lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+        
+        connectionStatus.connected = false;
+        connectionStatus.user = null;
 
-        console.log("❌ WhatsApp déconnecté.");
+        console.log(`❌ WhatsApp déconnecté (raison: ${statusCode})`);
 
-        if (shouldReconnect) {
-          console.log("🔁 Reconnexion...");
-          startWhatsApp();
+        // Session invalide
+        if (isLoggedOut) {
+          console.log("🚫 Session expirée - reset auth requis");
+          if (onInvalidSession) await onInvalidSession();
+          return;
+        }
+
+        // Reconnexion automatique
+        reconnectAttempts++;
+        
+        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+          console.log(`🔁 Reconnexion dans ${delay/1000}s (tentative ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+          
+          setTimeout(() => {
+            initWhatsApp(onQR, onConnected, onInvalidSession).catch(console.error);
+          }, delay);
         } else {
-          console.log("🚫 Session expirée. Re-scan requis.");
+          console.error("❌ Max tentatives atteint - arrêt");
         }
       }
-
-      if (connection === "open") {
-        console.log("✅ WhatsApp connecté !");
-      }
     });
 
-    // 📩 réception messages
-    sock.ev.on("messages.upsert", async ({ messages }) => {
+    // 📩 Messages reçus
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify") return;
+      
       const msg = messages[0];
-
       if (!msg.message) return;
 
-      console.log("📩 Nouveau message reçu");
+      // Log simple (peut être étendu)
+      console.log(`📩 Message reçu de ${msg.key.remoteJid}`);
     });
 
-  } catch (error) {
-    console.error("❌ Erreur WhatsApp:", error.message);
+    return { success: true };
 
-    // 🔁 retry automatique
-    setTimeout(() => {
-      startWhatsApp();
-    }, 5000);
+  } catch (error) {
+    console.error("❌ Erreur init WhatsApp:", error.message);
+    return { success: false, error: error.message };
   }
 };
 
-// 📤 envoyer message
+// ============================================================
+// 📤 ENVOI MESSAGE
+// ============================================================
 export const sendMessage = async (to, message) => {
-  if (!sock) throw new Error("WhatsApp non connecté");
+  try {
+    if (!sock) {
+      throw new Error("WhatsApp non connecté");
+    }
 
-  return await sock.sendMessage(to, { text: message });
+    if (!connectionStatus.connected) {
+      throw new Error("WhatsApp déconnecté");
+    }
+
+    // Formater le numéro
+    let jid = to;
+    if (!to.includes("@")) {
+      jid = to.replace(/[^0-9]/g, "") + "@s.whatsapp.net";
+    }
+
+    // Envoyer
+    const result = await sock.sendMessage(jid, { 
+      text: message 
+    });
+
+    return {
+      success: true,
+      messageId: result?.key?.id
+    };
+
+  } catch (error) {
+    console.error("❌ Erreur envoi message:", error.message);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
 };
 
-// 📊 status
-export const getStatus = () => {
+// ============================================================
+// 👥 ENVOI GROUPE
+// ============================================================
+export const sendToGroup = async (groupId, message) => {
+  try {
+    if (!sock) {
+      throw new Error("WhatsApp non connecté");
+    }
+
+    let jid = groupId;
+    if (!groupId.includes("@")) {
+      jid = groupId + "@g.us";
+    }
+
+    await sock.sendMessage(jid, { text: message });
+
+    return { success: true };
+
+  } catch (error) {
+    console.error("❌ Erreur envoi groupe:", error.message);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+};
+
+// ============================================================
+// 🔌 DISCONNECT
+// ============================================================
+export const disconnect = async () => {
+  try {
+    if (sock) {
+      await sock.end();
+      sock = null;
+    }
+    
+    connectionStatus.connected = false;
+    connectionStatus.user = null;
+    
+    console.log("🔌 WhatsApp déconnecté manuellement");
+    return { success: true };
+    
+  } catch (error) {
+    console.error("❌ Erreur disconnect:", error.message);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+};
+
+// ============================================================
+// 🔄 RESET AUTH
+// ============================================================
+export const resetAuth = async () => {
+  try {
+    // Déconnecter d'abord
+    if (sock) {
+      await sock.end();
+      sock = null;
+    }
+
+    // Supprimer fichiers auth
+    const authPath = path.join(process.cwd(), "auth");
+    if (existsSync(authPath)) {
+      const credsPath = path.join(authPath, "creds.json");
+      if (existsSync(credsPath)) {
+        unlinkSync(credsPath);
+        console.log("🗑️ Credentials supprimés");
+      }
+    }
+
+    connectionStatus.connected = false;
+    connectionStatus.user = null;
+    reconnectAttempts = 0;
+
+    console.log("🔄 Auth reset effectué");
+    return { success: true };
+
+  } catch (error) {
+    console.error("❌ Erreur reset auth:", error.message);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+};
+
+// ============================================================
+// 📊 STATUS DÉTAILLÉ
+// ============================================================
+export const getDetailedStatus = () => {
   return {
-    connected: !!sock
+    connected: connectionStatus.connected,
+    user: connectionStatus.user,
+    reconnectAttempts,
+    maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
+    sockExists: !!sock
   };
 };
