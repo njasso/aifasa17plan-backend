@@ -94,8 +94,18 @@ const transactionSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Index pour les recherches rapides et l'anti-doublon
-transactionSchema.index({ membreId: 1, annee: 1, sousType: 1 }, { unique: false });
+// Index pour les recherches rapides
+transactionSchema.index({ membreId: 1, annee: 1, sousType: 1 });
+// ✅ Index unique anti-doublon UNIQUEMENT pour les opérations uniques par an
+// (inscription et adhésion ne peuvent être saisies qu'une fois par an par membre)
+transactionSchema.index(
+  { membreId: 1, annee: 1, sousType: 1 },
+  { 
+    unique: true, 
+    partialFilterExpression: { sousType: { $in: ['inscription', 'adhesion'] } },
+    name: 'unique_inscription_adhesion_par_an'
+  }
+);
 transactionSchema.index({ membreId: 1, annee: 1, type: 1 });
 transactionSchema.index({ date: -1 });
 transactionSchema.index({ sousType: 1 });

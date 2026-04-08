@@ -12,43 +12,39 @@ import {
   sendRappel,
   sendMassRappels,
   generateFinancialReport,
-  getMemberStatement
+  getMemberStatement,
+  setTypeInscription       // ✅ nouveau
 } from '../controllers/financesController.js';
 import { protect, admin } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// ============================================================
-// Routes protégées (authentification requise)
-// ============================================================
+// Toutes les routes nécessitent une authentification
 router.use(protect);
 
-// Transactions
-router.get('/transactions', getTransactions);
-router.post('/transactions', addTransaction);
-router.put('/transactions/:id', updateTransaction);
-router.delete('/transactions/:id', deleteTransaction);
+// ── Transactions ──────────────────────────────────────────
+router.get('/transactions',        getTransactions);
+router.post('/transactions',       addTransaction);
+router.put('/transactions/:id',    admin, updateTransaction);   // ✅ admin en une seule fois
+router.delete('/transactions/:id', admin, deleteTransaction);   // ✅ supprimé le doublon
 
-// Dépenses
-router.get('/depenses', getExpenses);
+// ── Dépenses ─────────────────────────────────────────────
+router.get('/depenses',  getExpenses);
 router.post('/depenses', addExpense);
 
-// Soldes des caisses
+// ── Caisses & Statistiques ───────────────────────────────
 router.get('/soldes', getSoldes);
+router.get('/stats',  getFinancialStats);
 
-// Statistiques
-router.get('/stats', getFinancialStats);
+// ── Rappels ──────────────────────────────────────────────
+router.post('/rappels/masse',       sendMassRappels);   // ✅ /masse avant /:membreId
+router.post('/rappels/:membreId',   sendRappel);
 
-// Rappels
-router.post('/rappels/:membreId', sendRappel);
-router.post('/rappels/masse', sendMassRappels);
+// ── Rapports ─────────────────────────────────────────────
+router.get('/rapport',       generateFinancialReport);
+router.get('/etat-membres',  getMemberStatement);
 
-// Rapports
-router.get('/rapport', generateFinancialReport);
-router.get('/etat-membres', getMemberStatement);
-
-// Routes admin uniquement
-router.delete('/transactions/:id', admin, deleteTransaction);
-router.put('/transactions/:id', admin, updateTransaction);
+// ── Type inscription (marquer ancien/nouveau manuellement) ─
+router.put('/membres/:membreId/type-inscription', setTypeInscription);
 
 export default router;

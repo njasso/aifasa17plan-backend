@@ -48,6 +48,52 @@ const ECHEANCES = {
 // FONCTIONS UTILITAIRES
 // ============================================================
 
+/**
+ * Détermine le type réel d'un membre pour une année donnée.
+ * Règle : un membre est "ancien" si :
+ *   - Sa dateAdhesion est antérieure à l'année courante
+ *   - OU il a déjà payé une inscription >= 5000 F dans une année précédente
+ *   - OU il possède un flag typeInscription = 'ancien' sur son profil
+ * Un membre ne peut être "nouveau" (5000 F) qu'une seule fois dans sa vie d'adhérent.
+ */
+const determinerTypeMembre = async (membre, annee) => {
+  const anneeNum = parseInt(annee);
+
+  // 1. Flag explicite sur le profil (override manuel via l'API)
+  if (membre.typeInscription === 'ancien') {
+    return {
+      estNouveau: false,
+      estConsidererAncien: true,
+      montantInscription: COTISATIONS.inscriptionAncien,
+      raisonAncien: 'flag_manuel'
+    };
+  }
+
+  // 2. Vérifier la dateAdhesion
+  const anneeAdhesion = membre.dateAdhesion
+    ? new Date(membre.dateAdhesion).getFullYear()
+    : null;
+  const estNouveau = anneeAdhesion !== null && anneeAdhesion >= anneeNum;
+
+  // 3. A-t-il déjà payé >= 5000 F d'inscription une année précédente ?
+  //    Si oui, il ne peut plus être traité comme "nouveau" même si dateAdhesion dit le contraire
+  const inscriptionsAnterieures = await Transaction.find({
+    membreId: membre._id,
+    sousType: 'inscription',
+    annee: { $lt: anneeNum }
+  }).lean();
+
+  const aPaye5000Avant = inscriptionsAnterieures.some(t => t.montant >= COTISATIONS.inscriptionNouveau);
+  const estConsidererAncien = !estNouveau || aPaye5000Avant;
+
+  return {
+    estNouveau,
+    estConsidererAncien,
+    montantInscription: estConsidererAncien ? COTISATIONS.inscriptionAncien : COTISATIONS.inscriptionNouveau,
+    raisonAncien: aPaye5000Avant ? 'a_deja_paye_5000' : (!estNouveau ? 'date_adhesion_anterieure' : null)
+  };
+};
+
 const updateCaisseBalance = async (caisseName, montant, type, referenceId, description = null) => {
   let caisse = await Caisse.findOne({ caisse: caisseName });
   
@@ -105,51 +151,45 @@ const verifierDoublon = async (membreId, sousType, annee) => {
   return false;
 };
 
-// Calculer le montant dû par membre - CORRIGÉ
+// Calculer le montant dû par membre — utilise determinerTypeMembre
 const calculerMontantDu = async (membreId, annee) => {
   let montantDu = 0;
   let details = [];
-  
+  const anneeNum = parseInt(annee);
+
   const membre = await Membre.findById(membreId);
   if (!membre) return { montantDu: 0, details: [] };
-  
-  const dateAdhesion = membre.dateAdhesion;
-  const estNouveau = dateAdhesion && new Date(dateAdhesion).getFullYear() >= annee;
-  
-  // Vérifier si le membre a déjà payé 5000 F les années précédentes
-  const inscriptionsHistorique = await Transaction.find({
-    membreId,
-    sousType: 'inscription',
-    annee: { $lt: parseInt(annee) }
-  });
-  const aPaye5000Avant = inscriptionsHistorique.some(t => t.montant === 5000);
-  const estConsidererAncien = !estNouveau || aPaye5000Avant;
-  
-  // Adhésion
+
+  // ✅ Utilise la fonction unifiée de détermination du type
+  const { estNouveau, estConsidererAncien, montantInscription } = await determinerTypeMembre(membre, anneeNum);
+
+  // Adhésion (nouveaux membres uniquement, non-payée)
   const adhesion = await Transaction.findOne({ membreId, sousType: 'adhesion' });
   const adhesionPaye = !estNouveau || !!adhesion;
   if (estNouveau && !adhesionPaye) {
     montantDu += COTISATIONS.adhesion;
     details.push({ type: 'adhesion', montant: COTISATIONS.adhesion, label: 'Adhésion' });
   }
-  
-  // Inscription annuelle - CORRIGÉ avec historique
+
+  // Inscription annuelle — montant correct selon type membre
   const inscriptionTx = await Transaction.aggregate([
-    { $match: { membreId: new mongoose.Types.ObjectId(membreId), sousType: 'inscription', annee: parseInt(annee) } },
+    { $match: { membreId: new mongoose.Types.ObjectId(membreId), sousType: 'inscription', annee: anneeNum } },
     { $group: { _id: null, total: { $sum: '$montant' } } }
   ]);
   const inscriptionPaye = inscriptionTx[0]?.total || 0;
-  const montantInscription = estConsidererAncien ? COTISATIONS.inscriptionAncien : COTISATIONS.inscriptionNouveau;
-  
   if (inscriptionPaye < montantInscription) {
     const reste = montantInscription - inscriptionPaye;
     montantDu += reste;
-    details.push({ type: 'inscription', montant: reste, label: 'Inscription annuelle' });
+    details.push({
+      type: 'inscription',
+      montant: reste,
+      label: estConsidererAncien ? 'Renouvellement (ancien)' : 'Inscription (nouveau)'
+    });
   }
-  
+
   // Fonds Social
   const fondsSocialTx = await Transaction.aggregate([
-    { $match: { membreId: new mongoose.Types.ObjectId(membreId), sousType: 'fondsSocial', annee: parseInt(annee) } },
+    { $match: { membreId: new mongoose.Types.ObjectId(membreId), sousType: 'fondsSocial', annee: anneeNum } },
     { $group: { _id: null, total: { $sum: '$montant' } } }
   ]);
   const fondsSocialPaye = fondsSocialTx[0]?.total || 0;
@@ -158,8 +198,8 @@ const calculerMontantDu = async (membreId, annee) => {
     montantDu += reste;
     details.push({ type: 'fondsSocial', montant: reste, label: 'Fonds Social' });
   }
-  
-  return { montantDu, details, estConsidererAncien, estNouveau };
+
+  return { montantDu, details, estConsidererAncien, estNouveau, montantInscription };
 };
 
 // ============================================================
@@ -677,30 +717,41 @@ export const getMemberStatement = async (req, res) => {
   try {
     const { annee = new Date().getFullYear() } = req.query;
     const anneeNum = parseInt(annee);
-    
+
     const membres = await Membre.find({ actif: true });
     const resultats = [];
-    
+
+    // Compteurs budget réel
+    let budgetNouveaux = 0;   // uniquement 5000 × nb vrais nouveaux
+    let budgetAnciens  = 0;   // uniquement 2500 × nb anciens
+    let budgetTotal    = 0;
+
     for (const membre of membres) {
-      const transactions = await Transaction.find({
-        membreId: membre._id,
-        annee: anneeNum
-      });
-      
-      const { estConsidererAncien, estNouveau } = await calculerMontantDu(membre._id, anneeNum);
-      
-      const adhesion = transactions.find(t => t.sousType === 'adhesion');
-      const adhesionPaye = !estNouveau || !!adhesion;
-      
-      const inscription = transactions.filter(t => t.sousType === 'inscription').reduce((sum, t) => sum + t.montant, 0);
-      const fondsSocial = transactions.filter(t => t.sousType === 'fondsSocial').reduce((sum, t) => sum + t.montant, 0);
-      const contributionsAG = transactions.filter(t => t.sousType === 'contributionAG').reduce((sum, t) => sum + t.montant, 0);
-      const sanctions = transactions.filter(t => t.type === 'sanction').reduce((sum, t) => sum + t.montant, 0);
-      
-      const montantInscription = estConsidererAncien ? COTISATIONS.inscriptionAncien : COTISATIONS.inscriptionNouveau;
-      const totalDu = (estNouveau ? COTISATIONS.adhesion : 0) + montantInscription + COTISATIONS.fondsSocial;
-      const totalPaye = (adhesionPaye && estNouveau ? COTISATIONS.adhesion : 0) + inscription + fondsSocial;
-      
+      const txAnnee = await Transaction.find({ membreId: membre._id, annee: anneeNum }).lean();
+
+      // ✅ Type déterminé par la fonction unifiée (historique + flag manuel)
+      const { estNouveau, estConsidererAncien, montantInscription, raisonAncien } =
+        await determinerTypeMembre(membre, anneeNum);
+
+      const adhesionTx  = txAnnee.find(t => t.sousType === 'adhesion');
+      const adhesionPaye = !estNouveau || !!adhesionTx;
+
+      const insPaye  = txAnnee.filter(t => t.sousType === 'inscription').reduce((s, t) => s + t.montant, 0);
+      const fsPaye   = txAnnee.filter(t => t.sousType === 'fondsSocial').reduce((s, t) => s + t.montant, 0);
+      const agPaye   = txAnnee.filter(t => t.sousType === 'contributionAG').reduce((s, t) => s + t.montant, 0);
+      const sancMontant = txAnnee.filter(t => t.type === 'sanction').reduce((s, t) => s + t.montant, 0);
+
+      // ✅ Budget réel : on exclut complètement les 5000 F pour les anciens
+      const adhesionDue = estNouveau ? COTISATIONS.adhesion : 0;
+      const totalDu = adhesionDue + montantInscription + COTISATIONS.fondsSocial;
+      const totalPaye = (adhesionPaye && estNouveau ? COTISATIONS.adhesion : 0) + insPaye + fsPaye;
+      const resteDu = Math.max(0, totalDu - totalPaye + sancMontant);
+
+      // Cumul budget réel global
+      if (!estConsidererAncien) budgetNouveaux += montantInscription;
+      else                       budgetAnciens  += montantInscription;
+      budgetTotal += totalDu;
+
       resultats.push({
         membre: {
           _id: membre._id,
@@ -708,28 +759,84 @@ export const getMemberStatement = async (req, res) => {
           prenom: membre.prenom,
           email: membre.email,
           telephone: membre.telephone,
-          whatsapp: membre.whatsapp
+          whatsapp: membre.whatsapp,
+          typeInscription: membre.typeInscription || null
         },
         estNouveau,
         estConsidererAncien,
-        adhesion: { paye: adhesionPaye, montant: COTISATIONS.adhesion },
-        inscription: { paye: inscription, du: montantInscription, reste: Math.max(0, montantInscription - inscription) },
-        fondsSocial: { paye: fondsSocial, du: COTISATIONS.fondsSocial, reste: Math.max(0, COTISATIONS.fondsSocial - fondsSocial) },
-        contributionsAG,
-        sanctions,
+        raisonAncien,
+        adhesion: { paye: adhesionPaye, montant: COTISATIONS.adhesion, due: adhesionDue },
+        inscription: {
+          paye: insPaye,
+          du: montantInscription,
+          reste: Math.max(0, montantInscription - insPaye),
+          label: estConsidererAncien ? 'Renouvellement' : 'Inscription nouveau'
+        },
+        fondsSocial: { paye: fsPaye, du: COTISATIONS.fondsSocial, reste: Math.max(0, COTISATIONS.fondsSocial - fsPaye) },
+        fsT1Ok: fsPaye >= COTISATIONS.fondsSocialT1,
+        fsT2Ok: fsPaye >= COTISATIONS.fondsSocial,
+        contributionsAG: agPaye,
+        sanctions: sancMontant,
         totalPaye,
         totalDu,
-        resteDu: Math.max(0, totalDu - totalPaye),
-        statut: totalPaye >= totalDu ? 'a_jour' : 'retard'
+        resteDu,
+        statut: resteDu === 0 ? 'a_jour' : 'retard'
       });
     }
-    
+
     res.json({
       success: true,
-      data: resultats
+      data: resultats,
+      // ✅ Budget réel ventilé par type de membre
+      budgetReel: {
+        annee: anneeNum,
+        nouveaux: {
+          count: resultats.filter(r => !r.estConsidererAncien).length,
+          montantInscription: budgetNouveaux,
+          montantTotal: resultats.filter(r => !r.estConsidererAncien).reduce((s, r) => s + r.totalDu, 0)
+        },
+        anciens: {
+          count: resultats.filter(r => r.estConsidererAncien).length,
+          montantInscription: budgetAnciens,
+          montantTotal: resultats.filter(r => r.estConsidererAncien).reduce((s, r) => s + r.totalDu, 0)
+        },
+        totalTheorique: budgetTotal,
+        totalCollecte: resultats.reduce((s, r) => s + r.totalPaye, 0),
+        totalResteDu: resultats.reduce((s, r) => s + r.resteDu, 0)
+      }
     });
   } catch (error) {
     console.error('Erreur getMemberStatement:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+// ============================================================
+// MARQUER UN MEMBRE COMME ANCIEN (override manuel)
+// ============================================================
+export const setTypeInscription = async (req, res) => {
+  try {
+    const { membreId } = req.params;
+    const { typeInscription } = req.body; // 'nouveau' | 'ancien'
+
+    if (!['nouveau', 'ancien'].includes(typeInscription)) {
+      return res.status(400).json({ success: false, error: 'typeInscription doit être "nouveau" ou "ancien"' });
+    }
+
+    const membre = await Membre.findByIdAndUpdate(
+      membreId,
+      { typeInscription },
+      { new: true }
+    );
+
+    if (!membre) return res.status(404).json({ success: false, error: 'Membre non trouvé' });
+
+    res.json({
+      success: true,
+      message: `Membre marqué comme "${typeInscription}" — inscription à ${typeInscription === 'ancien' ? COTISATIONS.inscriptionAncien : COTISATIONS.inscriptionNouveau} FCFA`,
+      data: { _id: membre._id, nom: membre.nom, prenom: membre.prenom, typeInscription: membre.typeInscription }
+    });
+  } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -746,5 +853,6 @@ export default {
   sendRappel,
   sendMassRappels,
   generateFinancialReport,
-  getMemberStatement
+  getMemberStatement,
+  setTypeInscription
 };
