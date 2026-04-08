@@ -28,6 +28,11 @@ const allowedOrigins = [
   'http://localhost:5173',
   'http://127.0.0.1:3000',
   'http://127.0.0.1:5173',
+  'https://localhost',              // 🔥 AJOUTER CETTE LIGNE
+  'capacitor://localhost',        // Capacitor Android
+  'http://localhost',              // WebView local
+  'file://',                       // Fichiers locaux
+  'https://aifasa17plan-frontend.onrender.com',
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 

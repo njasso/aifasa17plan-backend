@@ -1,4 +1,4 @@
-// controllers/financesController.js
+// backend/controllers/financesController.js
 import { Transaction, Expense, Caisse, Rappel } from '../models/Finance.js';
 import Membre from '../models/Membre.js';
 import { emailService } from '../services/emailService.js';
@@ -6,26 +6,42 @@ import whatsappService from '../services/whatsappService.js';
 import mongoose from 'mongoose';
 
 // ============================================================
-// CONSTANTES
+// CONSTANTES - RÈGLES MÉTIER AIFASA 17
 // ============================================================
 const COTISATIONS = {
-  adhesion: 5000,
-  inscription: 2500,
+  adhesion: 2500,              // Unique pour nouveaux membres
+  inscriptionNouveau: 5000,    // Pour les nouveaux membres
+  inscriptionAncien: 2500,     // Pour les anciens membres (renouvellement)
   fondsSocial: 25000,
+  fondsSocialT1: 15000,
+  fondsSocialT2: 10000,
   contributionAG: 0
 };
 
 const SANCTIONS = {
-  absenceAG: 5000,
-  retardCotisation: 1000,
-  manquementDiscipline: 10000
+  absenceAG: 15000,           // Absence non justifiée à l'AG
+  desertionAG: 5000,          // Quitte l'AG avant la fin
+  retardAG: 1000,             // Arrive en retard à l'AG
+  perturbationAG: 1000,       // Trouble pendant l'AG
+  nonOrganisationAG: 10000,   // Refus d'organiser l'AG
+  retardCotisation: 1000,     // Paiement de cotisation en retard
+  manquementDiscipline: 10000, // Autres manquements disciplinaires
+};
+
+// Échéances fixes
+const ECHEANCES = {
+  fondsSocialT1: { mois: 2, jour: 28, montant: 15000, label: "Fonds Social — 1ère tranche" },
+  fondsSocialT2: { mois: 4, jour: 30, montant: 10000, label: "Fonds Social — 2ème tranche", grace: 14 },
+  agJuin: { mois: 6, jour: 7, label: "Contribution AG Juin" },
+  agDec: { mois: 12, jour: 7, label: "Contribution AG Décembre" },
+  inscription: { mois: 12, jour: 31, label: "Inscription annuelle" }
 };
 
 // ============================================================
 // FONCTIONS UTILITAIRES
 // ============================================================
 
-// Mettre à jour le solde d'une caisse (sans transaction)
+// Mettre à jour le solde d'une caisse
 const updateCaisseBalance = async (caisseName, montant, type, referenceId) => {
   let caisse = await Caisse.findOne({ caisse: caisseName });
   
@@ -69,6 +85,51 @@ const checkCriticalBalance = async (caisseName) => {
   if (caisse && caisse.solde < seuils[caisseName]) {
     console.log(`⚠️ Alerte: Solde critique pour la caisse ${caisseName}: ${caisse.solde} FCFA`);
   }
+};
+
+// Calculer le montant dû par membre
+const calculerMontantDu = async (membreId, annee) => {
+  let montantDu = 0;
+  let details = [];
+  
+  // Vérifier l'adhésion (uniquement pour les nouveaux membres)
+  const adhesion = await Transaction.findOne({ 
+    membreId, 
+    sousType: 'adhesion' 
+  });
+  const dateAdhesion = await Membre.findById(membreId).select('dateAdhesion');
+  const estNouveau = dateAdhesion && new Date(dateAdhesion.dateAdhesion).getFullYear() >= annee;
+  
+  if (estNouveau && !adhesion) {
+    montantDu += COTISATIONS.adhesion;
+    details.push({ type: 'adhesion', montant: COTISATIONS.adhesion, label: 'Adhésion' });
+  }
+  
+  // Vérifier l'inscription annuelle
+  const inscriptionTx = await Transaction.aggregate([
+    { $match: { membreId, sousType: 'inscription', annee } },
+    { $group: { _id: null, total: { $sum: '$montant' } } }
+  ]);
+  const inscriptionPaye = inscriptionTx[0]?.total || 0;
+  if (inscriptionPaye < COTISATIONS.inscription) {
+    const reste = COTISATIONS.inscription - inscriptionPaye;
+    montantDu += reste;
+    details.push({ type: 'inscription', montant: reste, label: 'Inscription annuelle' });
+  }
+  
+  // Vérifier le Fonds Social
+  const fondsSocialTx = await Transaction.aggregate([
+    { $match: { membreId, sousType: 'fondsSocial', annee } },
+    { $group: { _id: null, total: { $sum: '$montant' } } }
+  ]);
+  const fondsSocialPaye = fondsSocialTx[0]?.total || 0;
+  if (fondsSocialPaye < COTISATIONS.fondsSocial) {
+    const reste = COTISATIONS.fondsSocial - fondsSocialPaye;
+    montantDu += reste;
+    details.push({ type: 'fondsSocial', montant: reste, label: 'Fonds Social' });
+  }
+  
+  return { montantDu, details };
 };
 
 // ============================================================
@@ -118,7 +179,7 @@ export const getTransactions = async (req, res) => {
   }
 };
 
-// Ajouter une transaction (SANS TRANSACTION MONGODB)
+// Ajouter une transaction
 export const addTransaction = async (req, res) => {
   try {
     const { membreId, type, sousType, montant, date, description, mode, reference } = req.body;
@@ -188,7 +249,7 @@ export const updateTransaction = async (req, res) => {
   }
 };
 
-// Supprimer une transaction (SANS TRANSACTION MONGODB)
+// Supprimer une transaction
 export const deleteTransaction = async (req, res) => {
   try {
     const { id } = req.params;
@@ -259,7 +320,7 @@ export const getExpenses = async (req, res) => {
   }
 };
 
-// Ajouter une dépense (SANS TRANSACTION MONGODB)
+// Ajouter une dépense
 export const addExpense = async (req, res) => {
   try {
     const { caisse, montant, date, motif, beneficiaire, pieceJointe } = req.body;
@@ -382,10 +443,15 @@ export const getFinancialStats = async (req, res) => {
         { $group: { _id: null, total: { $sum: '$montant' } } }
       ]);
       
+      const dateAdhesion = membre.dateAdhesion;
+      const estNouveau = dateAdhesion && new Date(dateAdhesion).getFullYear() >= annee;
+      const adhesionPaye = !estNouveau || !!adhesion;
       const inscriptionPaye = inscription[0]?.total || 0;
       const fondsSocialPaye = fondsSocial[0]?.total || 0;
       
-      if (adhesion && inscriptionPaye >= COTISATIONS.inscription && fondsSocialPaye >= COTISATIONS.fondsSocial) {
+      const montantInscription = estNouveau ? COTISATIONS.inscriptionNouveau : COTISATIONS.inscriptionAncien;
+      
+      if (adhesionPaye && inscriptionPaye >= COTISATIONS.inscription && fondsSocialPaye >= COTISATIONS.fondsSocial) {
         membresAjour++;
       }
     }
@@ -419,51 +485,21 @@ export const sendRappel = async (req, res) => {
   try {
     const { membreId } = req.params;
     const { type } = req.body;
+    const annee = new Date().getFullYear();
     
     const membre = await Membre.findById(membreId);
     if (!membre) {
       return res.status(404).json({ success: false, error: 'Membre non trouvé' });
     }
     
-    // Calculer le montant dû
-    let montantDu = 0;
-    let message = '';
-    const annee = new Date().getFullYear();
-    
-    // Vérifier l'adhésion
-    const adhesion = await Transaction.findOne({ membreId, sousType: 'adhesion' });
-    if (!adhesion && type === 'cotisation') {
-      montantDu += COTISATIONS.adhesion;
-      message += `- Adhésion: ${COTISATIONS.adhesion.toLocaleString()} FCFA\n`;
-    }
-    
-    // Vérifier l'inscription annuelle
-    const inscription = await Transaction.aggregate([
-      { $match: { membreId, sousType: 'inscription', annee } },
-      { $group: { _id: null, total: { $sum: '$montant' } } }
-    ]);
-    const inscriptionPaye = inscription[0]?.total || 0;
-    if (inscriptionPaye < COTISATIONS.inscription && type === 'cotisation') {
-      montantDu += COTISATIONS.inscription - inscriptionPaye;
-      message += `- Inscription annuelle: ${(COTISATIONS.inscription - inscriptionPaye).toLocaleString()} FCFA\n`;
-    }
-    
-    // Vérifier le fonds social
-    const fondsSocial = await Transaction.aggregate([
-      { $match: { membreId, sousType: 'fondsSocial', annee } },
-      { $group: { _id: null, total: { $sum: '$montant' } } }
-    ]);
-    const fondsSocialPaye = fondsSocial[0]?.total || 0;
-    if (fondsSocialPaye < COTISATIONS.fondsSocial && type === 'cotisation') {
-      montantDu += COTISATIONS.fondsSocial - fondsSocialPaye;
-      message += `- Fonds social: ${(COTISATIONS.fondsSocial - fondsSocialPaye).toLocaleString()} FCFA\n`;
-    }
+    const { montantDu, details } = await calculerMontantDu(membreId, annee);
     
     if (montantDu === 0) {
       return res.json({ success: true, message: 'Ce membre est à jour de ses cotisations' });
     }
     
     // Préparer le message
+    const detailsText = details.map(d => `- ${d.label}: ${d.montant.toLocaleString()} FCFA`).join('\n');
     const fullMessage = `🔔 RAPPEL DE COTISATION AIFASA 17
 
 Cher/Chère ${membre.nom} ${membre.prenom},
@@ -471,7 +507,7 @@ Cher/Chère ${membre.nom} ${membre.prenom},
 Nous vous rappelons que votre situation financière présente un solde dû de ${montantDu.toLocaleString()} FCFA pour l'année ${annee}.
 
 Détail:
-${message}
+${detailsText}
 
 Merci de régulariser votre situation dans les meilleurs délais.
 
@@ -525,31 +561,7 @@ export const sendMassRappels = async (req, res) => {
     
     for (const membre of membres) {
       try {
-        // Calculer le montant dû
-        let montantDu = 0;
-        
-        const adhesion = await Transaction.findOne({ membreId: membre._id, sousType: 'adhesion' });
-        if (!adhesion && type === 'cotisation') {
-          montantDu += COTISATIONS.adhesion;
-        }
-        
-        const inscription = await Transaction.aggregate([
-          { $match: { membreId: membre._id, sousType: 'inscription', annee } },
-          { $group: { _id: null, total: { $sum: '$montant' } } }
-        ]);
-        const inscriptionPaye = inscription[0]?.total || 0;
-        if (inscriptionPaye < COTISATIONS.inscription && type === 'cotisation') {
-          montantDu += COTISATIONS.inscription - inscriptionPaye;
-        }
-        
-        const fondsSocial = await Transaction.aggregate([
-          { $match: { membreId: membre._id, sousType: 'fondsSocial', annee } },
-          { $group: { _id: null, total: { $sum: '$montant' } } }
-        ]);
-        const fondsSocialPaye = fondsSocial[0]?.total || 0;
-        if (fondsSocialPaye < COTISATIONS.fondsSocial && type === 'cotisation') {
-          montantDu += COTISATIONS.fondsSocial - fondsSocialPaye;
-        }
+        const { montantDu } = await calculerMontantDu(membre._id, annee);
         
         if (montantDu > 0 && membre.email) {
           const message = `🔔 RAPPEL DE COTISATION AIFASA 17
@@ -662,14 +674,20 @@ export const getMemberStatement = async (req, res) => {
         annee: parseInt(annee)
       });
       
+      const dateAdhesion = membre.dateAdhesion;
+      const estNouveau = dateAdhesion && new Date(dateAdhesion).getFullYear() >= annee;
+      
       const adhesion = transactions.find(t => t.sousType === 'adhesion');
+      const adhesionPaye = !estNouveau || !!adhesion;
+      
       const inscription = transactions.filter(t => t.sousType === 'inscription').reduce((sum, t) => sum + t.montant, 0);
       const fondsSocial = transactions.filter(t => t.sousType === 'fondsSocial').reduce((sum, t) => sum + t.montant, 0);
       const contributionsAG = transactions.filter(t => t.sousType === 'contributionAG').reduce((sum, t) => sum + t.montant, 0);
       const sanctions = transactions.filter(t => t.type === 'sanction').reduce((sum, t) => sum + t.montant, 0);
       
-      const totalDu = COTISATIONS.adhesion + COTISATIONS.inscription + COTISATIONS.fondsSocial;
-      const totalPaye = (adhesion ? COTISATIONS.adhesion : 0) + inscription + fondsSocial;
+const totalDu = (estNouveau ? COTISATIONS.adhesion : 0) 
+                + (estNouveau ? COTISATIONS.inscription : COTISATIONS.inscriptionAncien) 
+                + COTISATIONS.fondsSocial;      const totalPaye = (adhesionPaye && estNouveau ? COTISATIONS.adhesion : 0) + inscription + fondsSocial;
       
       resultats.push({
         membre: {
@@ -680,14 +698,15 @@ export const getMemberStatement = async (req, res) => {
           telephone: membre.telephone,
           whatsapp: membre.whatsapp
         },
-        adhesion: { paye: !!adhesion, montant: COTISATIONS.adhesion },
-        inscription: { paye: inscription, du: COTISATIONS.inscription, reste: COTISATIONS.inscription - inscription },
-        fondsSocial: { paye: fondsSocial, du: COTISATIONS.fondsSocial, reste: COTISATIONS.fondsSocial - fondsSocial },
+        estNouveau,
+        adhesion: { paye: adhesionPaye, montant: COTISATIONS.adhesion },
+        inscription: { paye: inscription, du: COTISATIONS.inscription, reste: Math.max(0, COTISATIONS.inscription - inscription) },
+        fondsSocial: { paye: fondsSocial, du: COTISATIONS.fondsSocial, reste: Math.max(0, COTISATIONS.fondsSocial - fondsSocial) },
         contributionsAG,
         sanctions,
         totalPaye,
         totalDu,
-        resteDu: totalDu - totalPaye,
+        resteDu: Math.max(0, totalDu - totalPaye),
         statut: totalPaye >= totalDu ? 'a_jour' : 'retard'
       });
     }
@@ -700,4 +719,22 @@ export const getMemberStatement = async (req, res) => {
     console.error('Erreur getMemberStatement:', error);
     res.status(500).json({ success: false, error: error.message });
   }
+};
+
+// ============================================================
+// EXPORTS
+// ============================================================
+export default {
+  getTransactions,
+  addTransaction,
+  updateTransaction,
+  deleteTransaction,
+  getExpenses,
+  addExpense,
+  getSoldes,
+  getFinancialStats,
+  sendRappel,
+  sendMassRappels,
+  generateFinancialReport,
+  getMemberStatement
 };
