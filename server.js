@@ -9,96 +9,77 @@ import http from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
 import { schedulerService } from './services/schedulerService.js';
 import { whatsappService } from './services/whatsappService.js';
 import logger, { setupUncaughtExceptions } from './utils/logger.js';
 
+// ============================================================
+// 🔥 INIT
+// ============================================================
 setupUncaughtExceptions();
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-dotenv.config();
-
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 10000;
 
+// ============================================================
+// ✅ CORS FIX (PROPRE ET STABLE)
+// ============================================================
 const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:5173',
-  'http://127.0.0.1:3000',
-  'http://127.0.0.1:5173',
-  'https://localhost',              // 🔥 AJOUTER CETTE LIGNE
-  'capacitor://localhost',        // Capacitor Android
-  'http://localhost',              // WebView local
-  'file://',                       // Fichiers locaux
   'https://aifasa17plan-frontend.onrender.com',
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (process.env.NODE_ENV !== 'production') return callback(null, true);
-    if (!origin || allowedOrigins.includes(origin)) callback(null, true);
-    else callback(new Error('Not allowed by CORS'));
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(null, true); // 🔥 autoriser tout temporairement
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
-  exposedHeaders: ['Content-Length', 'X-Requested-With'],
-  optionsSuccessStatus: 200,
 }));
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (process.env.NODE_ENV !== 'production') {
-    res.header('Access-Control-Allow-Origin', origin || '*');
-  } else if (allowedOrigins.includes(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-  }
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
+// 🔥 IMPORTANT pour OPTIONS
+app.options('*', cors());
 
+// ============================================================
+// 🔐 SECURITY + MIDDLEWARES
+// ============================================================
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
-  contentSecurityPolicy: process.env.NODE_ENV === 'production' ? {
-    directives: {
-      defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
-      fontSrc: ["'self'", 'https://fonts.gstatic.com'],
-      imgSrc: ["'self'", 'data:', 'https:'],
-      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
-    },
-  } : false,
 }));
 
 app.use(compression());
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
-if (process.env.NODE_ENV === 'production') {
-  app.use(morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) } }));
-} else {
-  app.use(morgan('dev'));
-}
+app.use(
+  process.env.NODE_ENV === 'production'
+    ? morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) } })
+    : morgan('dev')
+);
 
+// ============================================================
+// 📁 STATIC
+// ============================================================
 const uploadsDir = path.join(__dirname, '../uploads');
 app.use('/uploads', express.static(uploadsDir));
 
+// ============================================================
+// 🌐 HTTP + SOCKET.IO
+// ============================================================
 const server = http.createServer(app);
+
 const io = new Server(server, {
   cors: {
-    origin: process.env.NODE_ENV === 'production' ? allowedOrigins : '*',
+    origin: '*',
     credentials: true,
-    methods: ['GET', 'POST'],
-  },
-  connectionStateRecovery: {
-    maxDisconnectionDuration: 2 * 60 * 1000,
-    skipMiddlewares: true,
   },
 });
 
@@ -108,114 +89,57 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => logger.info(`🔌 Socket déconnecté: ${socket.id}`));
 });
 
-let isConnected = false;
+// ============================================================
+// 🗄️ MONGODB (NON BLOQUANT)
+// ============================================================
 let mongoRetryCount = 0;
 const MAX_MONGO_RETRIES = 5;
 
 const connectDB = async () => {
   try {
-    const mongoURI = process.env.MONGODB_URI || 'mongodb://localhost:27017/aifasa17';
-    await mongoose.connect(mongoURI, {
+    console.log("🔄 Connexion MongoDB...");
+    await mongoose.connect(process.env.MONGODB_URI, {
       serverSelectionTimeoutMS: 10000,
-      socketTimeoutMS: 45000,
-      connectTimeoutMS: 10000,
-      family: 4,
-      retryWrites: true,
-      retryReads: true,
     });
 
-    isConnected = true;
     mongoRetryCount = 0;
-    console.log('✅ MongoDB connecté avec succès');
-    console.log(` 📁 Base de données: ${mongoose.connection.name}`);
-    console.log(` 🔗 Hôte: ${mongoose.connection.host}`);
+    console.log("✅ MongoDB connecté");
 
     schedulerService.start();
-whatsappService.init().catch(err => {
-  console.warn('⚠️ WhatsApp non disponible, le serveur continue:', err.message);
-});
+
   } catch (err) {
-    isConnected = false;
     mongoRetryCount++;
-    console.error(`❌ Erreur MongoDB (tentative ${mongoRetryCount}/${MAX_MONGO_RETRIES}):`, err.message);
+    console.error(`❌ MongoDB (${mongoRetryCount}/${MAX_MONGO_RETRIES}):`, err.message);
+
     if (mongoRetryCount < MAX_MONGO_RETRIES) {
       setTimeout(connectDB, 5000);
-    } else {
-      console.error('❌ Impossible de se connecter à MongoDB après plusieurs tentatives');
     }
   }
 };
 
-mongoose.connection.on('error', (err) => {
-  logger.error('MongoDB error:', err);
-  isConnected = false;
-});
-
-mongoose.connection.on('disconnected', () => {
-  logger.warn('MongoDB déconnecté, reconnexion...');
-  isConnected = false;
-  setTimeout(connectDB, 5000);
-});
-
-mongoose.connection.on('reconnected', () => {
-  logger.info('MongoDB reconnecté');
-  isConnected = true;
-});
-
 connectDB();
 
-
 // ============================================================
-// INITIALISATION WHATSAPP (NON BLOQUANT)
+// 🤖 WHATSAPP (NON BLOQUANT)
 // ============================================================
-// WhatsApp est un service optionnel. Le serveur démarre même si WhatsApp échoue.
-
 const startWhatsApp = async () => {
   if (process.env.WHATSAPP_ENABLED !== 'true') {
-    logger.info('📵 WhatsApp désactivé dans la configuration (WHATSAPP_ENABLED=false)');
+    logger.info('📵 WhatsApp désactivé');
     return;
   }
 
   try {
-    logger.info('🔄 Initialisation WhatsApp en arrière-plan...');
-    const result = await whatsappService.init();
-    
-    if (result?.success) {
-      logger.info('✅ Service WhatsApp initialisé');
-    } else {
-      logger.warn('⚠️ WhatsApp initialisé avec avertissements:', result?.error || 'Inconnu');
-    }
+    logger.info('🔄 Initialisation WhatsApp...');
+    await whatsappService.init();
+    logger.info('✅ WhatsApp prêt');
   } catch (err) {
-    logger.warn('⚠️ WhatsApp non disponible, le serveur continue sans WhatsApp:', err.message);
+    logger.warn('⚠️ WhatsApp erreur:', err.message);
   }
 };
 
-// Lancer WhatsApp sans attendre (non bloquant)
-startWhatsApp();
-
 // ============================================================
-// DÉMARRAGE DU SERVEUR HTTP
+// 📦 ROUTES
 // ============================================================
-server.listen(PORT, async () => {
-  const waStatus = await whatsappService.getStatus().catch(() => ({ connected: false }));
-
-  console.log(`
-  🌿 AIFASA 17 API
-  ═══════════════════════════════════════════════════════════════════════
-  🚀 Serveur: http://localhost:${PORT}
-  📊 Health: http://localhost:${PORT}/health
-  📚 Documentation: http://localhost:${PORT}/api/docs
-  🌍 Environnement: ${process.env.NODE_ENV || 'development'}
-  🤖 IA DeepSeek: ${process.env.DEEPSEEK_API_KEY ? '✅ Configurée' : '❌ Non configurée'}
-  📧 Email: ${process.env.SMTP_USER ? '✅ Configuré' : '❌ Non configuré'}
-  💬 WhatsApp: ${waStatus.connected ? `✅ Connecté (${waStatus.user?.name || 'Session'})` : '⏳ En attente de scan QR / Désactivé'}
-  💰 Finances: ✅ Actif (gestion des cotisations, sanctions, caisses)
-  🔌 WebSocket: ✅ Actif
-  ═══════════════════════════════════════════════════════════════════════
-  `);
-});
-
-// Import des routes
 import authRoutes from './routes/auth.js';
 import memberRoutes from './routes/members.js';
 import activityRoutes from './routes/activities.js';
@@ -233,7 +157,6 @@ import ressourceRoutes from './routes/ressources.js';
 import webhookRoutes from './routes/webhook.js';
 import financesRoutes from './routes/finances.js';
 
-// Utilisation des routes
 app.use('/api/auth', authRoutes);
 app.use('/api/members', memberRoutes);
 app.use('/api/activities', activityRoutes);
@@ -251,101 +174,57 @@ app.use('/api/ressources', ressourceRoutes);
 app.use('/api/webhook', webhookRoutes);
 app.use('/api/finances', financesRoutes);
 
-app.get('/test-cors', (req, res) => res.json({ message: 'CORS OK', timestamp: new Date() }));
-
+// ============================================================
+// ❤️ HEALTH CHECK (IMPORTANT RENDER)
+// ============================================================
 app.get('/health', async (req, res) => {
-  const dbStatus = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' }[mongoose.connection.readyState] || 'unknown';
-  const waStatus = await whatsappService.getStatus();
+  let waStatus = { connected: false };
+  try {
+    waStatus = await whatsappService.getStatus();
+  } catch {}
+
   res.json({
     status: 'UP',
-    timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development',
-    services: {
-      database: { status: dbStatus, name: mongoose.connection.name, host: mongoose.connection.host },
-      ai: { configured: !!process.env.DEEPSEEK_API_KEY, provider: 'DeepSeek' },
-      email: { configured: !!(process.env.SMTP_USER && process.env.SMTP_PASS) },
-      whatsapp: { connected: waStatus.connected, user: waStatus.user, provider: 'Baileys' },
-      websocket: { status: 'active', connections: io.engine?.clientsCount || 0 },
-      finances: { status: 'active', version: '1.0.0' }
-    },
-    version: '2.1.0',
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    whatsapp: waStatus.connected,
   });
 });
 
-app.get('/', (req, res) => res.json({ 
-  name: 'AIFASA 17 API', 
-  version: '2.1.0',
-  endpoints: {
-    auth: '/api/auth',
-    members: '/api/members',
-    activities: '/api/activities',
-    finances: '/api/finances',
-    dashboard: '/api/dashboard',
-    reports: '/api/reports'
-  }
-}));
+app.get('/', (req, res) => {
+  res.json({ name: 'AIFASA API', status: 'OK' });
+});
 
+// ============================================================
+// ❌ 404 + ERROR HANDLER
+// ============================================================
 app.use((req, res) => {
-  logger.warn(`Route non trouvée: ${req.method} ${req.originalUrl}`);
-  res.status(404).json({ success: false, error: 'Route non trouvée', path: req.originalUrl });
+  res.status(404).json({ error: 'Route non trouvée' });
 });
 
 app.use((err, req, res, next) => {
-  logger.error(`Erreur serveur: ${err.message}`, { stack: err.stack });
-
-  if (err.name === 'ValidationError') {
-    return res.status(400).json({ success: false, error: 'Erreur de validation', details: Object.values(err.errors).map(e => e.message) });
-  }
-  if (err.name === 'CastError') {
-    return res.status(400).json({ success: false, error: 'ID invalide', field: err.path });
-  }
-  if (err.code === 11000) {
-    const field = Object.keys(err.keyPattern)[0];
-    return res.status(409).json({ success: false, error: `"${field}" existe déjà`, field });
-  }
-  if (err.name === 'JsonWebTokenError') return res.status(401).json({ success: false, error: 'Token invalide' });
-  if (err.name === 'TokenExpiredError') return res.status(401).json({ success: false, error: 'Token expiré' });
-
-  res.status(err.status || 500).json({
-    success: false,
-    error: process.env.NODE_ENV === 'production' ? 'Erreur interne du serveur' : err.message,
-  });
+  logger.error(err.message);
+  res.status(500).json({ error: 'Erreur serveur' });
 });
 
-server.listen(PORT, async () => {
-  const waStatus = await whatsappService.getStatus();
+// ============================================================
+// 🚀 START SERVER (UNE SEULE FOIS)
+// ============================================================
+server.listen(PORT, () => {
+  console.log(`🚀 Serveur lancé sur ${PORT}`);
 
-  console.log(`
-  🌿 AIFASA 17 API
-  ═══════════════════════════════════════════════════════════════════════
-  🚀 Serveur: http://localhost:${PORT}
-  📊 Health: http://localhost:${PORT}/health
-  📚 Documentation: http://localhost:${PORT}/api/docs
-  🌍 Environnement: ${process.env.NODE_ENV || 'development'}
-  🤖 IA DeepSeek: ${process.env.DEEPSEEK_API_KEY ? '✅ Configurée' : '❌ Non configurée'}
-  📧 Email: ${process.env.SMTP_USER ? '✅ Configuré' : '❌ Non configuré'}
-  💬 WhatsApp: ${waStatus.connected ? `✅ Connecté (${waStatus.user?.name || 'Session'})` : '🔄 En initialisation...'}
-  💰 Finances: ✅ Actif (gestion des cotisations, sanctions, caisses)
-  🔌 WebSocket: ✅ Actif
-  ═══════════════════════════════════════════════════════════════════════
-  `);
+  // 🔥 WhatsApp en arrière-plan
+  startWhatsApp();
 });
 
-const gracefulShutdown = async () => {
-  console.log('\n🛑 Arrêt du serveur...');
-  io.close(() => logger.info('Socket.io fermé'));
-  schedulerService.stop();
+// ============================================================
+// 🛑 SHUTDOWN
+// ============================================================
+process.on('SIGINT', async () => {
+  console.log("🛑 Arrêt serveur...");
   await mongoose.connection.close();
-  server.close(() => {
-    logger.info('✅ Serveur arrêté proprement');
-    process.exit(0);
-  });
-  setTimeout(() => { logger.error('Arrêt forcé'); process.exit(1); }, 10000);
-};
-
-process.on('SIGINT', gracefulShutdown);
-process.on('SIGTERM', gracefulShutdown);
+  process.exit(0);
+});
 
 export { app, server, io };
 export default app;
