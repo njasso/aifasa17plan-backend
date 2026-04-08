@@ -6,12 +6,30 @@ import {
   resetAuth,
   getGroups as getGroupsBaileys,
   sendToGroup as sendToGroupBaileys,
+  getReconnectAttempts,
+  resetReconnectAttempts,
 } from './whatsappBaileys.js';
 
 import logger from '../utils/logger.js';
 import qrcode from 'qrcode-terminal';
 
 let initialized = false;
+let invalidSessionCount = 0;
+const MAX_INVALID_SESSIONS = 3;
+
+// ✅ FIX : Rate limiting — file d'attente pour éviter le ban WhatsApp
+const MESSAGE_DELAY_MS = 1500; // 1.5s minimum entre chaque message
+let lastSentAt = 0;
+
+const rateLimitedSend = async (fn) => {
+  const now = Date.now();
+  const elapsed = now - lastSentAt;
+  if (elapsed < MESSAGE_DELAY_MS) {
+    await new Promise(r => setTimeout(r, MESSAGE_DELAY_MS - elapsed));
+  }
+  lastSentAt = Date.now();
+  return fn();
+};
 
 const init = async () => {
   if (initialized) {
@@ -30,19 +48,29 @@ const init = async () => {
       },
       () => {
         logger.info('✅ WhatsApp connecté');
+        invalidSessionCount = 0;
+        resetReconnectAttempts();
       },
       async () => {
-        logger.warn('❌ Session invalide → réinitialisation');
         initialized = false;
+        invalidSessionCount++;
+
+        // ✅ FIX : Stopper la boucle si trop de sessions invalides
+        if (invalidSessionCount > MAX_INVALID_SESSIONS) {
+          logger.error(`❌ Session invalide ${invalidSessionCount} fois — arrêt automatique. Reconnexion manuelle requise.`);
+          return;
+        }
+
+        logger.warn(`❌ Session invalide (tentative ${invalidSessionCount}/${MAX_INVALID_SESSIONS}) → réinitialisation`);
         await resetAuth();
-        setTimeout(() => init(), 3000);
+        setTimeout(() => init(), 5000);
       }
     );
     return { success: true, message: 'Initialisation réussie' };
   } catch (err) {
-    logger.error('❌ Erreur lors de l\'initialisation:', err);
+    logger.error('❌ Erreur init WhatsApp:', err);
     initialized = false;
-    return { success: false, error: err.message || 'Erreur inconnue lors de l\'initialisation' };
+    return { success: false, error: err.message || 'Erreur inconnue' };
   }
 };
 
@@ -51,10 +79,7 @@ export const whatsappService = {
   init,
 
   /**
-   * Envoyer un message WhatsApp
-   * @param {string} to - Numéro de téléphone du destinataire
-   * @param {string} message - Contenu du message
-   * @returns {Promise<{success: boolean, messageId?: string, error?: string}>}
+   * Envoyer un message WhatsApp avec rate limiting
    */
   async send({ to, message }) {
     try {
@@ -63,150 +88,111 @@ export const whatsappService = {
         return { success: false, error: 'Non connecté à WhatsApp' };
       }
 
-      const result = await sendMessage(to, message);
+      // ✅ FIX : Rate limiting appliqué
+      const result = await rateLimitedSend(() => sendMessage(to, message));
 
-      // Vérification du résultat
-      if (!result) {
-        return { success: false, error: 'Réponse vide du service WhatsApp' };
+      if (!result) return { success: false, error: 'Réponse vide du service WhatsApp' };
+      if (result.success === false) return { success: false, error: result.error || 'Erreur envoi' };
+
+      if (result.truncated) {
+        logger.warn(`⚠️ Message tronqué à 4096 caractères pour ${to}`);
       }
 
-      if (result.success === false) {
-        return { success: false, error: result.error || 'Erreur inconnue lors de l\'envoi' };
-      }
-
-      return { success: true, messageId: result.messageId || result.id, error: null };
+      return { success: true, messageId: result.messageId, error: null };
     } catch (err) {
-      logger.error(`❌ Erreur lors de l'envoi à ${to}:`, err);
-      return { success: false, error: err.message || 'Erreur inconnue lors de l\'envoi' };
+      logger.error(`❌ Erreur envoi à ${to}:`, err);
+      return { success: false, error: err.message || 'Erreur inconnue' };
     }
   },
 
   /**
-   * Obtenir le statut de la connexion
-   * @returns {Promise<{connected: boolean, error?: string}>}
+   * Envoyer en masse avec rate limiting intégré
    */
+  async sendBulk(recipients) {
+    const results = [];
+    for (const { to, message } of recipients) {
+      const result = await this.send({ to, message });
+      results.push({ to, ...result });
+    }
+    return results;
+  },
+
   async getStatus() {
     try {
       const status = getConnectionStatus();
-      return { connected: status.connected, error: status.error };
+      return {
+        connected: status.connected,
+        user: status.user,
+        retryCount: status.retryCount,
+        invalidSessionCount,
+        error: status.error,
+      };
     } catch (err) {
-      logger.error('❌ Erreur lors de la récupération du statut:', err);
+      logger.error('❌ Erreur statut WhatsApp:', err);
       return { connected: false, error: err.message || 'Erreur inconnue' };
     }
   },
 
-  /**
-   * Déconnecter WhatsApp
-   * @returns {Promise<{success: boolean, error?: string}>}
-   */
   async disconnect() {
     try {
       await disconnect();
       initialized = false;
       return { success: true };
     } catch (err) {
-      logger.error('❌ Erreur lors de la déconnexion:', err);
-      return { success: false, error: err.message || 'Erreur inconnue lors de la déconnexion' };
+      logger.error('❌ Erreur déconnexion WhatsApp:', err);
+      return { success: false, error: err.message || 'Erreur inconnue' };
     }
   },
 
-  /**
-   * Réinitialiser l'authentification
-   * @returns {Promise<{success: boolean, error?: string}>}
-   */
   async resetAuth() {
     try {
       await resetAuth();
       initialized = false;
+      invalidSessionCount = 0;
       setTimeout(() => init(), 3000);
       return { success: true };
     } catch (err) {
-      logger.error('❌ Erreur lors de la réinitialisation:', err);
-      return { success: false, error: err.message || 'Erreur inconnue lors de la réinitialisation' };
+      logger.error('❌ Erreur réinitialisation WhatsApp:', err);
+      return { success: false, error: err.message || 'Erreur inconnue' };
     }
   },
 
-  /**
-   * Obtenir la liste des groupes WhatsApp
-   * @returns {Promise<{success: boolean, data?: Array, error?: string}>}
-   */
   async getGroups() {
     try {
       const groups = await getGroupsBaileys();
       return { success: true, data: groups };
     } catch (err) {
-      logger.error('❌ Erreur lors de la récupération des groupes:', err);
-      return { success: false, error: err.message || 'Erreur inconnue lors de la récupération des groupes' };
+      logger.error('❌ Erreur récupération groupes:', err);
+      return { success: false, error: err.message || 'Erreur inconnue' };
     }
   },
 
-  /**
-   * Envoyer un message à un groupe WhatsApp
-   * @param {string} groupId - ID du groupe
-   * @param {string} message - Contenu du message
-   * @returns {Promise<{success: boolean, messageId?: string, error?: string}>}
-   */
   async sendToGroup(groupId, message) {
     try {
       if (!getConnectionStatus().connected) {
-        logger.warn('❌ Pas connecté à WhatsApp');
         return { success: false, error: 'Non connecté à WhatsApp' };
       }
 
-      const result = await sendToGroupBaileys(groupId, message);
+      // ✅ Rate limiting aussi pour les groupes
+      const result = await rateLimitedSend(() => sendToGroupBaileys(groupId, message));
 
-      if (!result) {
-        return { success: false, error: 'Réponse vide du service WhatsApp' };
-      }
-
-      if (result.success === false) {
-        return { success: false, error: result.error || 'Erreur inconnue lors de l\'envoi au groupe' };
-      }
+      if (!result) return { success: false, error: 'Réponse vide du service WhatsApp' };
+      if (result.success === false) return { success: false, error: result.error || 'Erreur envoi groupe' };
 
       return { success: true, messageId: result.messageId || result.id, error: null };
     } catch (err) {
-      logger.error(`❌ Erreur lors de l'envoi au groupe ${groupId}:`, err);
-      return { success: false, error: err.message || 'Erreur inconnue lors de l\'envoi au groupe' };
+      logger.error(`❌ Erreur envoi groupe ${groupId}:`, err);
+      return { success: false, error: err.message || 'Erreur inconnue' };
     }
   },
 
-  // Formatters pour les messages
   formatters: {
-    /**
-     * Formater un message standard
-     * @param {Object} params - Paramètres du message
-     * @param {string} params.sujet - Sujet du message
-     * @param {string} params.contenu - Contenu du message
-     * @param {string} params.expediteur - Nom de l'expéditeur
-     * @returns {string} - Message formaté
-     */
     message: ({ sujet, contenu, expediteur }) => {
       return `📢 *${sujet || 'Nouveau message'}*\n\n${contenu}\n\n_— ${expediteur || 'AIFASA 17'}_`;
     },
-
-    /**
-     * Formater une alerte
-     * @param {Object} params - Paramètres de l'alerte
-     * @param {string} params.titre - Titre de l'alerte
-     * @param {string} params.message - Message de l'alerte
-     * @param {string} params.activite - Activité concernée
-     * @param {Date} params.dateFin - Date de fin
-     * @param {string} params.priorite - Priorité
-     * @param {number} params.jours - Jours restants
-     * @returns {string} - Alerte formatée
-     */
     alerte: ({ titre, message, activite, dateFin, priorite, jours }) => {
       const emojiPriorite = priorite === 'haute' ? '🔴' : priorite === 'moyenne' ? '🟡' : '🟢';
-      return `
-${emojiPriorite} *${titre || 'Rappel important'}*
-
-${message || `L'activité "${activite || ''}" se termine le ${dateFin ? new Date(dateFin).toLocaleDateString('fr-FR') : 'soon'}.`}
-
-📅 *Jours restants: ${jours || '?'}*
-📌 *Priorité: ${priorite || 'normale'}*
-
-_— AIFASA 17_
-      `.trim();
+      return `${emojiPriorite} *${titre || 'Rappel important'}*\n\n${message || `L'activité "${activite || ''}" se termine le ${dateFin ? new Date(dateFin).toLocaleDateString('fr-FR') : 'bientôt'}.`}\n\n📅 *Jours restants: ${jours || '?'}*\n📌 *Priorité: ${priorite || 'normale'}*\n\n_— AIFASA 17_`.trim();
     }
   }
 };
