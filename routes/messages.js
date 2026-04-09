@@ -45,16 +45,26 @@ router.get('/', async (req, res) => {
 });
 
 // GET /api/messages/groups - Récupérer les groupes WhatsApp
+// GET /api/messages/groups - Récupérer les groupes WhatsApp
 router.get('/groups', async (req, res) => {
   try {
-    const groups = await whatsappService.getGroups();
-    if (!groups.success) {
-      return res.status(500).json({ success: false, message: groups.error || 'Erreur lors de la récupération des groupes' });
+    // Vérifier si la méthode existe
+    if (typeof whatsappService.getGroups !== 'function') {
+      logger.warn('⚠️ whatsappService.getGroups non disponible');
+      return res.json([]);
     }
-    res.json(groups.data); // ← tableau direct
+    
+    const groups = await whatsappService.getGroups();
+    
+    if (!groups.success) {
+      logger.warn('⚠️ Erreur récupération groupes:', groups.error);
+      return res.json([]);
+    }
+    
+    res.json(groups.data || []);
   } catch (err) {
     logger.error('Erreur GET /messages/groups:', err);
-    res.status(500).json({ success: false, message: err.message });
+    res.json([]);
   }
 });
 

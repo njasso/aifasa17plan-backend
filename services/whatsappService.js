@@ -1,3 +1,4 @@
+// services/whatsappService.js
 import {
   initWhatsApp,
   sendMessage,
@@ -7,6 +8,7 @@ import {
   sendToGroup as sendToGroupBaileys,
   getReconnectAttempts,
   resetReconnectAttempts,
+  getGroups as getBaileysGroups,  // ✅ AJOUTÉ
 } from './whatsappBaileys.js';
 
 import logger from '../utils/logger.js';
@@ -84,7 +86,7 @@ const init = async () => {
           initPromise = null;
 
           if (invalidSessionCount >= MAX_INVALID_SESSIONS) {
-            logger.error('❌ Trop d’échecs - arrêt temporaire');
+            logger.error('❌ Trop d\'échecs - arrêt temporaire');
             return;
           }
 
@@ -112,7 +114,6 @@ const init = async () => {
       initialized = false;
       initPromise = null;
 
-      // 🔁 retry auto
       setTimeout(() => {
         init().catch(() => {});
       }, 5000);
@@ -207,6 +208,36 @@ export const whatsappService = {
 
     } catch (err) {
       return { success: false, error: err.message };
+    }
+  },
+
+  // ============================================================
+  // 👥 RÉCUPÉRER LES GROUPES WHATSAPP
+  // ============================================================
+  async getGroups() {
+    try {
+      const status = getConnectionStatus();
+      
+      if (!status.connected || !initialized) {
+        logger.warn('⚠️ WhatsApp non connecté, impossible de récupérer les groupes');
+        return { success: false, error: 'WhatsApp non connecté', data: [] };
+      }
+      
+      const groups = await getBaileysGroups();
+      
+      logger.info(`📋 ${groups.length} groupes WhatsApp récupérés`);
+      
+      return { 
+        success: true, 
+        data: groups.map(g => ({
+          id: g.id,
+          name: g.subject || g.name,
+          participants: g.participantCount || g.participants?.length || 0
+        }))
+      };
+    } catch (err) {
+      logger.error('❌ Erreur getGroups:', err.message);
+      return { success: false, error: err.message, data: [] };
     }
   },
 

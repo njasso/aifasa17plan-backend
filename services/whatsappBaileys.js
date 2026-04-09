@@ -33,6 +33,43 @@ export const resetReconnectAttempts = () => {
 };
 
 // ============================================================
+// 👥 RÉCUPÉRER LES GROUPES WHATSAPP
+// ============================================================
+export const getGroups = async () => {
+  try {
+    if (!sock) {
+      console.log("⚠️ WhatsApp non connecté, impossible de récupérer les groupes");
+      return [];
+    }
+
+    if (!connectionStatus.connected) {
+      console.log("⚠️ WhatsApp déconnecté, impossible de récupérer les groupes");
+      return [];
+    }
+
+    // Récupérer tous les groupes
+    const groups = await sock.groupFetchAllParticipating();
+    
+    // Transformer en tableau
+    const groupList = Object.values(groups).map(g => ({
+      id: g.id,
+      subject: g.subject,
+      name: g.subject,
+      participants: g.participants || [],
+      participantCount: g.participants?.length || 0,
+      description: g.desc || '',
+      owner: g.owner
+    }));
+
+    console.log(`📋 ${groupList.length} groupes WhatsApp récupérés`);
+    return groupList;
+  } catch (error) {
+    console.error("❌ Erreur getGroups:", error.message);
+    return [];
+  }
+};
+
+// ============================================================
 // 🚀 INIT WHATSAPP
 // ============================================================
 export const initWhatsApp = async (onQR, onConnected, onInvalidSession) => {
@@ -131,7 +168,6 @@ export const initWhatsApp = async (onQR, onConnected, onInvalidSession) => {
       const msg = messages[0];
       if (!msg.message) return;
 
-      // Log simple (peut être étendu)
       console.log(`📩 Message reçu de ${msg.key.remoteJid}`);
     });
 
