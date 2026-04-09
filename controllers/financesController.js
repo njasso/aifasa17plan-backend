@@ -141,6 +141,10 @@ const verifierDoublon = async (membreId, sousType, annee) => {
   return false;
 };
 
+// backend/controllers/financesController.js
+
+// Remplacer la fonction calculerMontantDu par celle-ci :
+
 const calculerMontantDu = async (membreId, annee) => {
   let montantDu = 0;
   let details = [];
@@ -149,50 +153,67 @@ const calculerMontantDu = async (membreId, annee) => {
   const membre = await Membre.findById(membreId);
   if (!membre) return { montantDu: 0, details: [] };
 
-  const { estNouveau, estConsidererAncien, montantInscription } = await determinerTypeMembre(membre, anneeNum);
+  // ✅ NOUVELLE LOGIQUE SIMPLIFIÉE
+  // Plus d'adhésion, plus de distinction nouveau/ancien
+  // Uniquement : Inscription annuelle 2500F + Fonds Social 25000F
 
-  // Adhésion
-  const adhesion = await Transaction.findOne({ membreId, sousType: { $in: ['adhesion', 'pack_nouveau'] } });
-  const adhesionPaye = !estNouveau || !!adhesion;
-  if (estNouveau && !adhesionPaye) {
-    montantDu += COTISATIONS.adhesion;
-    details.push({ type: 'adhesion', montant: COTISATIONS.adhesion, label: 'Adhésion' });
-  }
-
-  // Inscription annuelle
+  // Inscription annuelle (2500 F pour tous)
   const inscriptionTx = await Transaction.aggregate([
-    { $match: { membreId: new mongoose.Types.ObjectId(membreId), sousType: { $in: ['inscription', 'pack_nouveau'] }, annee: anneeNum } },
+    { $match: { 
+      membreId: new mongoose.Types.ObjectId(membreId), 
+      sousType: 'inscription', 
+      annee: anneeNum 
+    } },
     { $group: { _id: null, total: { $sum: '$montant' } } }
   ]);
   const inscriptionPaye = inscriptionTx[0]?.total || 0;
   
-  // Ajuster pour le pack
-  const packTx = await Transaction.findOne({ membreId, sousType: 'pack_nouveau', annee: anneeNum });
-  const insPayeReel = inscriptionPaye + (packTx ? 5000 : 0);
+  const MONTANT_INSCRIPTION = 2500; // Fixe pour tous
   
-  if (insPayeReel < montantInscription) {
-    const reste = montantInscription - insPayeReel;
+  if (inscriptionPaye < MONTANT_INSCRIPTION) {
+    const reste = MONTANT_INSCRIPTION - inscriptionPaye;
     montantDu += reste;
     details.push({
       type: 'inscription',
       montant: reste,
-      label: estConsidererAncien ? 'Renouvellement (ancien)' : 'Inscription (nouveau)'
+      label: 'Inscription annuelle'
     });
   }
 
-  // Fonds Social
+  // Fonds Social (25000 F)
   const fondsSocialTx = await Transaction.aggregate([
-    { $match: { membreId: new mongoose.Types.ObjectId(membreId), sousType: { $in: ['fondsSocial', 'fondsSocial_t1', 'fondsSocial_t2'] }, annee: anneeNum } },
+    { $match: { 
+      membreId: new mongoose.Types.ObjectId(membreId), 
+      sousType: { $in: ['fondsSocial', 'fondsSocial_t1', 'fondsSocial_t2'] }, 
+      annee: anneeNum 
+    } },
     { $group: { _id: null, total: { $sum: '$montant' } } }
   ]);
   const fondsSocialPaye = fondsSocialTx[0]?.total || 0;
-  if (fondsSocialPaye < COTISATIONS.fondsSocial) {
-    const reste = COTISATIONS.fondsSocial - fondsSocialPaye;
+  
+  const MONTANT_FONDS_SOCIAL = 25000;
+  
+  if (fondsSocialPaye < MONTANT_FONDS_SOCIAL) {
+    const reste = MONTANT_FONDS_SOCIAL - fondsSocialPaye;
     montantDu += reste;
-    details.push({ type: 'fondsSocial', montant: reste, label: 'Fonds Social' });
+    details.push({ 
+      type: 'fondsSocial', 
+      montant: reste, 
+      label: 'Fonds Social' 
+    });
   }
 
-  return { montantDu, details, estConsidererAncien, estNouveau, montantInscription };
+  // Contribution AG (optionnelle, pas incluse dans le dû obligatoire)
+  // On ne l'ajoute pas au montantDu, mais on peut la mentionner
+  
+  return { 
+    montantDu, 
+    details,
+    inscriptionPaye,
+    fondsSocialPaye,
+    MONTANT_INSCRIPTION,
+    MONTANT_FONDS_SOCIAL
+  };
 };
 
 // ============================================================
@@ -622,12 +643,22 @@ export const getFinancialStats = async (req, res) => {
     ]);
     
     const membres = await Membre.find({ actif: true });
-    let membresAjour = 0;
-    
-    for (const membre of membres) {
-      const { montantDu } = await calculerMontantDu(membre._id, anneeNum);
-      if (montantDu === 0) membresAjour++;
-    }
+   
+   let membresAjour = 0;
+const MONTANT_INSCRIPTION = 2500;
+const MONTANT_FONDS_SOCIAL = 25000;
+
+for (const membre of membres) {
+  const txAnnee = await Transaction.find({ membreId: membre._id, annee: anneeNum }).lean();
+  
+  const insPaye = txAnnee.filter(t => t.sousType === 'inscription').reduce((s, t) => s + t.montant, 0);
+  const fsPaye = txAnnee.filter(t => t.sousType?.startsWith('fondsSocial')).reduce((s, t) => s + t.montant, 0);
+  
+  const totalPaye = insPaye + fsPaye;
+  const totalDu = MONTANT_INSCRIPTION + MONTANT_FONDS_SOCIAL;
+  
+  if (totalPaye >= totalDu) membresAjour++;
+}
     
     res.json({
       success: true,
@@ -825,44 +856,38 @@ export const getMemberStatement = async (req, res) => {
     const membres = await Membre.find({ actif: true });
     const resultats = [];
 
-    for (const membre of membres) {
-      const txAnnee = await Transaction.find({ membreId: membre._id, annee: anneeNum }).lean();
+   // Dans getMemberStatement, remplacer la boucle par :
 
-      const { estNouveau, estConsidererAncien, montantInscription } = await determinerTypeMembre(membre, anneeNum);
+for (const membre of membres) {
+  const txAnnee = await Transaction.find({ membreId: membre._id, annee: anneeNum }).lean();
 
-      const packTx = txAnnee.find(t => t.sousType === 'pack_nouveau');
-      const adhesionTx = txAnnee.find(t => t.sousType === 'adhesion');
-      const adhesionPaye = !!packTx || !!adhesionTx || !estNouveau;
+  // ✅ NOUVELLE LOGIQUE SIMPLIFIÉE
+  const insPaye = txAnnee.filter(t => t.sousType === 'inscription').reduce((s, t) => s + t.montant, 0);
+  const fsPaye = txAnnee.filter(t => t.sousType?.startsWith('fondsSocial')).reduce((s, t) => s + t.montant, 0);
+  const agPaye = txAnnee.filter(t => t.sousType?.startsWith('contributionAG')).reduce((s, t) => s + t.montant, 0);
+  const sancMontant = txAnnee.filter(t => t.type === 'sanction').reduce((s, t) => s + t.montant, 0);
 
-      const insPaye = txAnnee.filter(t => t.sousType === 'inscription').reduce((s, t) => s + t.montant, 0) + (packTx ? 5000 : 0);
-      const fsPaye = txAnnee.filter(t => t.sousType?.startsWith('fondsSocial')).reduce((s, t) => s + t.montant, 0);
-      const agPaye = txAnnee.filter(t => t.sousType?.startsWith('contributionAG')).reduce((s, t) => s + t.montant, 0);
-      const sancMontant = txAnnee.filter(t => t.type === 'sanction').reduce((s, t) => s + t.montant, 0);
+  const MONTANT_INSCRIPTION = 2500;
+  const MONTANT_FONDS_SOCIAL = 25000;
+  
+  const totalDu = MONTANT_INSCRIPTION + MONTANT_FONDS_SOCIAL;
+  const totalPaye = insPaye + fsPaye + agPaye;
+  const resteDu = Math.max(0, totalDu - totalPaye + sancMontant);
 
-      const adhesionDue = estNouveau && !adhesionPaye ? COTISATIONS.adhesion : 0;
-      const totalDu = adhesionDue + montantInscription + COTISATIONS.fondsSocial;
-      const totalPaye = (adhesionPaye && estNouveau ? COTISATIONS.adhesion : 0) + insPaye + fsPaye + agPaye;
-      const resteDu = Math.max(0, totalDu - totalPaye + sancMontant);
-
-      resultats.push({
-        membre: { _id: membre._id, nom: membre.nom, prenom: membre.prenom },
-        estNouveau,
-        estConsidererAncien,
-        packPaye: !!packTx,
-        adhesionPaye,
-        inscription: { paye: insPaye, du: montantInscription, reste: Math.max(0, montantInscription - insPaye) },
-        fondsSocial: { paye: fsPaye, du: COTISATIONS.fondsSocial, reste: Math.max(0, COTISATIONS.fondsSocial - fsPaye) },
-        fsT1Ok: fsPaye >= COTISATIONS.fondsSocialT1,
-        fsT2Ok: fsPaye >= COTISATIONS.fondsSocial,
-        contributionsAG: agPaye,
-        sanctions: sancMontant,
-        totalPaye,
-        totalDu,
-        resteDu,
-        statut: resteDu === 0 ? 'a_jour' : 'retard'
-      });
-    }
-
+  resultats.push({
+    membre: { _id: membre._id, nom: membre.nom, prenom: membre.prenom },
+    inscription: { paye: insPaye, du: MONTANT_INSCRIPTION, reste: Math.max(0, MONTANT_INSCRIPTION - insPaye) },
+    fondsSocial: { paye: fsPaye, du: MONTANT_FONDS_SOCIAL, reste: Math.max(0, MONTANT_FONDS_SOCIAL - fsPaye) },
+    fsT1Ok: fsPaye >= 15000,
+    fsT2Ok: fsPaye >= 25000,
+    contributionsAG: agPaye,
+    sanctions: sancMontant,
+    totalPaye,
+    totalDu,
+    resteDu,
+    statut: resteDu === 0 ? 'a_jour' : 'retard'
+  });
+}
     res.json({ success: true, data: resultats });
   } catch (error) {
     console.error('Erreur getMemberStatement:', error);
