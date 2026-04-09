@@ -18,10 +18,18 @@ const COTISATIONS = {
   contributionAG: 0
 };
 
+// Pack Nouveau Membre = 7500 F
+const PACK_NOUVEAU = {
+  adhesion: 2500,
+  inscription: 5000,
+  total: 7500
+};
+
 // Liste des opérations UNIQUES par année (anti-doublon)
 const OPERATIONS_UNIQUES_PAR_AN = [
   'inscription',
   'adhesion',
+  'pack_nouveau',
   'fondsSocial_t1',
   'fondsSocial_t2'
 ];
@@ -36,30 +44,16 @@ const SANCTIONS = {
   manquementDiscipline: 10000,
 };
 
-const ECHEANCES = {
-  fondsSocialT1: { mois: 2, jour: 28, montant: 15000, label: "Fonds Social — 1ère tranche" },
-  fondsSocialT2: { mois: 4, jour: 30, montant: 10000, label: "Fonds Social — 2ème tranche", grace: 14 },
-  agJuin: { mois: 6, jour: 7, label: "Contribution AG Juin" },
-  agDec: { mois: 12, jour: 7, label: "Contribution AG Décembre" },
-  inscription: { mois: 12, jour: 31, label: "Inscription annuelle" }
-};
-
 // ============================================================
 // FONCTIONS UTILITAIRES
 // ============================================================
 
 /**
  * Détermine le type réel d'un membre pour une année donnée.
- * Règle : un membre est "ancien" si :
- *   - Sa dateAdhesion est antérieure à l'année courante
- *   - OU il a déjà payé une inscription >= 5000 F dans une année précédente
- *   - OU il possède un flag typeInscription = 'ancien' sur son profil
- * Un membre ne peut être "nouveau" (5000 F) qu'une seule fois dans sa vie d'adhérent.
  */
 const determinerTypeMembre = async (membre, annee) => {
   const anneeNum = parseInt(annee);
 
-  // 1. Flag explicite sur le profil (override manuel via l'API)
   if (membre.typeInscription === 'ancien') {
     return {
       estNouveau: false,
@@ -69,28 +63,25 @@ const determinerTypeMembre = async (membre, annee) => {
     };
   }
 
-  // 2. Vérifier la dateAdhesion
   const anneeAdhesion = membre.dateAdhesion
     ? new Date(membre.dateAdhesion).getFullYear()
     : null;
   const estNouveau = anneeAdhesion !== null && anneeAdhesion >= anneeNum;
 
-  // 3. A-t-il déjà payé >= 5000 F d'inscription une année précédente ?
-  //    Si oui, il ne peut plus être traité comme "nouveau" même si dateAdhesion dit le contraire
   const inscriptionsAnterieures = await Transaction.find({
     membreId: membre._id,
-    sousType: 'inscription',
+    sousType: { $in: ['inscription', 'pack_nouveau'] },
     annee: { $lt: anneeNum }
   }).lean();
 
-  const aPaye5000Avant = inscriptionsAnterieures.some(t => t.montant >= COTISATIONS.inscriptionNouveau);
-  const estConsidererAncien = !estNouveau || aPaye5000Avant;
+  const aPayeAvant = inscriptionsAnterieures.length > 0;
+  const estConsidererAncien = !estNouveau || aPayeAvant;
 
   return {
     estNouveau,
     estConsidererAncien,
     montantInscription: estConsidererAncien ? COTISATIONS.inscriptionAncien : COTISATIONS.inscriptionNouveau,
-    raisonAncien: aPaye5000Avant ? 'a_deja_paye_5000' : (!estNouveau ? 'date_adhesion_anterieure' : null)
+    raisonAncien: aPayeAvant ? 'a_deja_paye' : (!estNouveau ? 'date_adhesion_anterieure' : null)
   };
 };
 
@@ -138,7 +129,6 @@ const checkCriticalBalance = async (caisseName) => {
   }
 };
 
-// Vérifier si une opération est un doublon
 const verifierDoublon = async (membreId, sousType, annee) => {
   if (OPERATIONS_UNIQUES_PAR_AN.includes(sousType)) {
     const existe = await Transaction.findOne({
@@ -151,7 +141,6 @@ const verifierDoublon = async (membreId, sousType, annee) => {
   return false;
 };
 
-// Calculer le montant dû par membre — utilise determinerTypeMembre
 const calculerMontantDu = async (membreId, annee) => {
   let montantDu = 0;
   let details = [];
@@ -160,25 +149,29 @@ const calculerMontantDu = async (membreId, annee) => {
   const membre = await Membre.findById(membreId);
   if (!membre) return { montantDu: 0, details: [] };
 
-  // ✅ Utilise la fonction unifiée de détermination du type
   const { estNouveau, estConsidererAncien, montantInscription } = await determinerTypeMembre(membre, anneeNum);
 
-  // Adhésion (nouveaux membres uniquement, non-payée)
-  const adhesion = await Transaction.findOne({ membreId, sousType: 'adhesion' });
+  // Adhésion
+  const adhesion = await Transaction.findOne({ membreId, sousType: { $in: ['adhesion', 'pack_nouveau'] } });
   const adhesionPaye = !estNouveau || !!adhesion;
   if (estNouveau && !adhesionPaye) {
     montantDu += COTISATIONS.adhesion;
     details.push({ type: 'adhesion', montant: COTISATIONS.adhesion, label: 'Adhésion' });
   }
 
-  // Inscription annuelle — montant correct selon type membre
+  // Inscription annuelle
   const inscriptionTx = await Transaction.aggregate([
-    { $match: { membreId: new mongoose.Types.ObjectId(membreId), sousType: 'inscription', annee: anneeNum } },
+    { $match: { membreId: new mongoose.Types.ObjectId(membreId), sousType: { $in: ['inscription', 'pack_nouveau'] }, annee: anneeNum } },
     { $group: { _id: null, total: { $sum: '$montant' } } }
   ]);
   const inscriptionPaye = inscriptionTx[0]?.total || 0;
-  if (inscriptionPaye < montantInscription) {
-    const reste = montantInscription - inscriptionPaye;
+  
+  // Ajuster pour le pack
+  const packTx = await Transaction.findOne({ membreId, sousType: 'pack_nouveau', annee: anneeNum });
+  const insPayeReel = inscriptionPaye + (packTx ? 5000 : 0);
+  
+  if (insPayeReel < montantInscription) {
+    const reste = montantInscription - insPayeReel;
     montantDu += reste;
     details.push({
       type: 'inscription',
@@ -189,7 +182,7 @@ const calculerMontantDu = async (membreId, annee) => {
 
   // Fonds Social
   const fondsSocialTx = await Transaction.aggregate([
-    { $match: { membreId: new mongoose.Types.ObjectId(membreId), sousType: 'fondsSocial', annee: anneeNum } },
+    { $match: { membreId: new mongoose.Types.ObjectId(membreId), sousType: { $in: ['fondsSocial', 'fondsSocial_t1', 'fondsSocial_t2'] }, annee: anneeNum } },
     { $group: { _id: null, total: { $sum: '$montant' } } }
   ]);
   const fondsSocialPaye = fondsSocialTx[0]?.total || 0;
@@ -250,9 +243,8 @@ export const getTransactions = async (req, res) => {
 
 export const addTransaction = async (req, res) => {
   try {
-    const { membreId, type, sousType, montant, date, description, mode, reference, sourceCaisse } = req.body;
+    const { membreId, type, sousType, montant, date, description, mode, reference, sourceCaisse, notes } = req.body;
     
-    // Vérifier que le membre existe
     const membre = await Membre.findById(membreId);
     if (!membre) {
       return res.status(404).json({ success: false, error: 'Membre non trouvé' });
@@ -261,47 +253,59 @@ export const addTransaction = async (req, res) => {
     const anneeOperation = new Date(date || new Date()).getFullYear();
     
     // ANTI-DOUBLON
-    const estDoublon = await verifierDoublon(membreId, sousType, anneeOperation);
-    if (estDoublon) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Cette opération a déjà été effectuée pour ce membre cette année' 
-      });
-    }
-    
-    // Si paiement depuis caisse Fonds Social
-    if (sourceCaisse === 'fondsSocial') {
-      const caisseFS = await Caisse.findOne({ caisse: 'fondsSocial' });
-      if (!caisseFS || caisseFS.solde < montant) {
+    if (sousType !== 'pack_nouveau') {
+      const estDoublon = await verifierDoublon(membreId, sousType, anneeOperation);
+      if (estDoublon) {
         return res.status(400).json({ 
           success: false, 
-          error: `Solde insuffisant dans la caisse Fonds Social (${caisseFS?.solde || 0} F disponible)` 
+          error: 'Cette opération a déjà été effectuée pour ce membre cette année' 
         });
       }
-      
-      // Créer une dépense automatique
-      const expense = new Expense({
-        caisse: 'fondsSocial',
-        montant,
-        date: date || new Date(),
-        motif: `Paiement ${sousType} - ${membre.nom} ${membre.prenom}`,
-        beneficiaire: 'Transfert interne',
-        annee: anneeOperation,
-        createdBy: req.user?.id
-      });
-      await expense.save();
-      await updateCaisseBalance('fondsSocial', montant, 'debit', expense._id, `Prélèvement pour ${sousType}`);
     }
     
-    // Créer la transaction
+    // Gestion du Pack Nouveau Membre
+    if (sousType === 'pack_nouveau') {
+      // Vérifier que le pack n'a pas déjà été payé
+      const packExiste = await Transaction.findOne({ membreId, sousType: 'pack_nouveau', annee: anneeOperation });
+      if (packExiste) {
+        return res.status(400).json({ success: false, error: 'Pack Nouveau Membre déjà payé cette année' });
+      }
+      
+      // Créer la transaction pack
+      const transactionPack = new Transaction({
+        membreId,
+        type: 'cotisation',
+        sousType: 'pack_nouveau',
+        montant: PACK_NOUVEAU.total,
+        date: date || new Date(),
+        description: description || 'Pack Nouveau Membre (Adhésion 2500 + Inscription 5000)',
+        mode: mode || 'especes',
+        notes,
+        annee: anneeOperation,
+        trimestre: Math.floor(new Date(date || new Date()).getMonth() / 3) + 1,
+        createdBy: req.user?.id
+      });
+      await transactionPack.save();
+      
+      await updateCaisseBalance('fonctionnement', PACK_NOUVEAU.total, 'credit', transactionPack._id);
+      
+      return res.json({
+        success: true,
+        data: transactionPack,
+        message: 'Pack Nouveau Membre enregistré avec succès (Adhésion 2500 + Inscription 5000)'
+      });
+    }
+    
+    // Transaction normale
     const transaction = new Transaction({
       membreId,
       type,
       sousType,
       montant,
       date: date || new Date(),
-      description: description || `${sousType}${sourceCaisse === 'fondsSocial' ? ' (prélevé sur caisse FS)' : ''}`,
-      mode: sourceCaisse === 'fondsSocial' ? 'transfert' : (mode || 'especes'),
+      description: description || sousType,
+      mode: mode || 'especes',
+      notes,
       reference: reference || `TXN-${Date.now()}`,
       annee: anneeOperation,
       trimestre: Math.floor(new Date(date || new Date()).getMonth() / 3) + 1,
@@ -311,14 +315,12 @@ export const addTransaction = async (req, res) => {
     
     await transaction.save();
     
-    // Mettre à jour le solde de la caisse concernée (si pas déjà fait pour FS)
-    if (sourceCaisse !== 'fondsSocial') {
-      let caisseName = 'fonctionnement';
-      if (sousType === 'fondsSocial') caisseName = 'fondsSocial';
-      else if (sousType === 'contributionAG') caisseName = 'ag';
-      
-      await updateCaisseBalance(caisseName, montant, 'credit', transaction._id);
-    }
+    // Mettre à jour la caisse
+    let caisseName = 'fonctionnement';
+    if (sousType?.startsWith('fondsSocial')) caisseName = 'fondsSocial';
+    else if (sousType?.startsWith('contributionAG')) caisseName = 'ag';
+    
+    await updateCaisseBalance(caisseName, montant, 'credit', transaction._id);
     
     res.json({
       success: true,
@@ -363,10 +365,10 @@ export const deleteTransaction = async (req, res) => {
     }
     
     let caisseName = 'fonctionnement';
-    if (transaction.sousType === 'fondsSocial') caisseName = 'fondsSocial';
-    else if (transaction.sousType === 'contributionAG') caisseName = 'ag';
+    if (transaction.sousType?.startsWith('fondsSocial')) caisseName = 'fondsSocial';
+    else if (transaction.sousType?.startsWith('contributionAG')) caisseName = 'ag';
     
-    await updateCaisseBalance(caisseName, transaction.montant, 'debit', null);
+    await updateCaisseBalance(caisseName, transaction.montant, 'debit', null, 'Annulation transaction');
     await transaction.deleteOne();
     
     res.json({ success: true, message: 'Transaction supprimée' });
@@ -422,7 +424,7 @@ export const getExpenses = async (req, res) => {
 
 export const addExpense = async (req, res) => {
   try {
-    const { caisse, montant, date, motif, beneficiaire, pieceJointe } = req.body;
+    const { caisse, montant, date, motif, beneficiaire, pieceJointe, notes } = req.body;
     
     const caisseDoc = await Caisse.findOne({ caisse });
     if (!caisseDoc || caisseDoc.solde < montant) {
@@ -436,12 +438,13 @@ export const addExpense = async (req, res) => {
       motif,
       beneficiaire,
       pieceJointe,
+      notes,
       annee: new Date(date || new Date()).getFullYear(),
       createdBy: req.user?.id
     });
     
     await expense.save();
-    await updateCaisseBalance(caisse, montant, 'debit', expense._id);
+    await updateCaisseBalance(caisse, montant, 'debit', expense._id, motif);
     await checkCriticalBalance(caisse);
     
     res.json({
@@ -455,12 +458,114 @@ export const addExpense = async (req, res) => {
   }
 };
 
+// ✅ NOUVEAU : Modifier une dépense
+export const modifierDepense = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+    
+    const expense = await Expense.findById(id);
+    if (!expense) {
+      return res.status(404).json({ success: false, error: 'Dépense non trouvée' });
+    }
+    
+    // Si le montant change, ajuster la caisse
+    if (updates.montant && updates.montant !== expense.montant) {
+      const difference = updates.montant - expense.montant;
+      await updateCaisseBalance(expense.caisse, Math.abs(difference), 
+        difference > 0 ? 'debit' : 'credit', id, 'Ajustement dépense');
+    }
+    
+    Object.assign(expense, updates);
+    expense.updatedAt = new Date();
+    await expense.save();
+    
+    res.json({ success: true, data: expense, message: 'Dépense mise à jour' });
+  } catch (error) {
+    console.error('Erreur modifierDepense:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+// ✅ NOUVEAU : Approuver une dépense
+export const approuverDepense = async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const expense = await Expense.findByIdAndUpdate(
+      id,
+      { 
+        approbation: 'approuve',
+        approuvePar: req.user.id,
+        dateApprobation: new Date()
+      },
+      { new: true }
+    );
+    
+    if (!expense) {
+      return res.status(404).json({ success: false, error: 'Dépense non trouvée' });
+    }
+    
+    res.json({ success: true, data: expense, message: 'Dépense approuvée' });
+  } catch (error) {
+    console.error('Erreur approuverDepense:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+// ✅ NOUVEAU : Virement entre caisses
+export const effectuerVirement = async (req, res) => {
+  try {
+    const { caisseSource, caisseDest, montant, motif, date } = req.body;
+    
+    if (caisseSource === caisseDest) {
+      return res.status(400).json({ success: false, error: 'Les caisses source et destination doivent être différentes' });
+    }
+    
+    const caisseSrc = await Caisse.findOne({ caisse: caisseSource });
+    if (!caisseSrc || caisseSrc.solde < montant) {
+      return res.status(400).json({ 
+        success: false, 
+        error: `Solde insuffisant dans ${caisseSource} (${caisseSrc?.solde || 0} F disponible)` 
+      });
+    }
+    
+    const anneeOperation = new Date(date || new Date()).getFullYear();
+    
+    // Débiter la source
+    await updateCaisseBalance(caisseSource, montant, 'debit', null, `Virement vers ${caisseDest}: ${motif}`);
+    
+    // Créditer la destination
+    await updateCaisseBalance(caisseDest, montant, 'credit', null, `Virement depuis ${caisseSource}: ${motif}`);
+    
+    // Créer une dépense pour tracer le virement
+    const expense = new Expense({
+      caisse: caisseSource,
+      montant,
+      date: date || new Date(),
+      motif: `Virement vers ${caisseDest} - ${motif}`,
+      beneficiaire: caisseDest,
+      annee: anneeOperation,
+      approbation: 'approuve',
+      approuvePar: req.user.id,
+      createdBy: req.user.id
+    });
+    await expense.save();
+    
+    res.json({ success: true, message: 'Virement effectué avec succès' });
+  } catch (error) {
+    console.error('Erreur effectuerVirement:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
 // ============================================================
 // CAISSES
 // ============================================================
 
 export const getSoldes = async (req, res) => {
   try {
+    const { annee } = req.query;
     const caisses = await Caisse.find();
     
     const soldes = {
@@ -638,7 +743,6 @@ export const sendMassRappels = async (req, res) => {
         }
       } catch (err) {
         erreurs++;
-        console.error(`Erreur pour ${membre.email}:`, err);
       }
     }
     
@@ -721,57 +825,32 @@ export const getMemberStatement = async (req, res) => {
     const membres = await Membre.find({ actif: true });
     const resultats = [];
 
-    // Compteurs budget réel
-    let budgetNouveaux = 0;   // uniquement 5000 × nb vrais nouveaux
-    let budgetAnciens  = 0;   // uniquement 2500 × nb anciens
-    let budgetTotal    = 0;
-
     for (const membre of membres) {
       const txAnnee = await Transaction.find({ membreId: membre._id, annee: anneeNum }).lean();
 
-      // ✅ Type déterminé par la fonction unifiée (historique + flag manuel)
-      const { estNouveau, estConsidererAncien, montantInscription, raisonAncien } =
-        await determinerTypeMembre(membre, anneeNum);
+      const { estNouveau, estConsidererAncien, montantInscription } = await determinerTypeMembre(membre, anneeNum);
 
-      const adhesionTx  = txAnnee.find(t => t.sousType === 'adhesion');
-      const adhesionPaye = !estNouveau || !!adhesionTx;
+      const packTx = txAnnee.find(t => t.sousType === 'pack_nouveau');
+      const adhesionTx = txAnnee.find(t => t.sousType === 'adhesion');
+      const adhesionPaye = !!packTx || !!adhesionTx || !estNouveau;
 
-      const insPaye  = txAnnee.filter(t => t.sousType === 'inscription').reduce((s, t) => s + t.montant, 0);
-      const fsPaye   = txAnnee.filter(t => t.sousType === 'fondsSocial').reduce((s, t) => s + t.montant, 0);
-      const agPaye   = txAnnee.filter(t => t.sousType === 'contributionAG').reduce((s, t) => s + t.montant, 0);
+      const insPaye = txAnnee.filter(t => t.sousType === 'inscription').reduce((s, t) => s + t.montant, 0) + (packTx ? 5000 : 0);
+      const fsPaye = txAnnee.filter(t => t.sousType?.startsWith('fondsSocial')).reduce((s, t) => s + t.montant, 0);
+      const agPaye = txAnnee.filter(t => t.sousType?.startsWith('contributionAG')).reduce((s, t) => s + t.montant, 0);
       const sancMontant = txAnnee.filter(t => t.type === 'sanction').reduce((s, t) => s + t.montant, 0);
 
-      // ✅ Budget réel : on exclut complètement les 5000 F pour les anciens
-      const adhesionDue = estNouveau ? COTISATIONS.adhesion : 0;
+      const adhesionDue = estNouveau && !adhesionPaye ? COTISATIONS.adhesion : 0;
       const totalDu = adhesionDue + montantInscription + COTISATIONS.fondsSocial;
-      const totalPaye = (adhesionPaye && estNouveau ? COTISATIONS.adhesion : 0) + insPaye + fsPaye;
+      const totalPaye = (adhesionPaye && estNouveau ? COTISATIONS.adhesion : 0) + insPaye + fsPaye + agPaye;
       const resteDu = Math.max(0, totalDu - totalPaye + sancMontant);
 
-      // Cumul budget réel global
-      if (!estConsidererAncien) budgetNouveaux += montantInscription;
-      else                       budgetAnciens  += montantInscription;
-      budgetTotal += totalDu;
-
       resultats.push({
-        membre: {
-          _id: membre._id,
-          nom: membre.nom,
-          prenom: membre.prenom,
-          email: membre.email,
-          telephone: membre.telephone,
-          whatsapp: membre.whatsapp,
-          typeInscription: membre.typeInscription || null
-        },
+        membre: { _id: membre._id, nom: membre.nom, prenom: membre.prenom },
         estNouveau,
         estConsidererAncien,
-        raisonAncien,
-        adhesion: { paye: adhesionPaye, montant: COTISATIONS.adhesion, due: adhesionDue },
-        inscription: {
-          paye: insPaye,
-          du: montantInscription,
-          reste: Math.max(0, montantInscription - insPaye),
-          label: estConsidererAncien ? 'Renouvellement' : 'Inscription nouveau'
-        },
+        packPaye: !!packTx,
+        adhesionPaye,
+        inscription: { paye: insPaye, du: montantInscription, reste: Math.max(0, montantInscription - insPaye) },
         fondsSocial: { paye: fsPaye, du: COTISATIONS.fondsSocial, reste: Math.max(0, COTISATIONS.fondsSocial - fsPaye) },
         fsT1Ok: fsPaye >= COTISATIONS.fondsSocialT1,
         fsT2Ok: fsPaye >= COTISATIONS.fondsSocial,
@@ -784,27 +863,7 @@ export const getMemberStatement = async (req, res) => {
       });
     }
 
-    res.json({
-      success: true,
-      data: resultats,
-      // ✅ Budget réel ventilé par type de membre
-      budgetReel: {
-        annee: anneeNum,
-        nouveaux: {
-          count: resultats.filter(r => !r.estConsidererAncien).length,
-          montantInscription: budgetNouveaux,
-          montantTotal: resultats.filter(r => !r.estConsidererAncien).reduce((s, r) => s + r.totalDu, 0)
-        },
-        anciens: {
-          count: resultats.filter(r => r.estConsidererAncien).length,
-          montantInscription: budgetAnciens,
-          montantTotal: resultats.filter(r => r.estConsidererAncien).reduce((s, r) => s + r.totalDu, 0)
-        },
-        totalTheorique: budgetTotal,
-        totalCollecte: resultats.reduce((s, r) => s + r.totalPaye, 0),
-        totalResteDu: resultats.reduce((s, r) => s + r.resteDu, 0)
-      }
-    });
+    res.json({ success: true, data: resultats });
   } catch (error) {
     console.error('Erreur getMemberStatement:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -817,7 +876,7 @@ export const getMemberStatement = async (req, res) => {
 export const setTypeInscription = async (req, res) => {
   try {
     const { membreId } = req.params;
-    const { typeInscription } = req.body; // 'nouveau' | 'ancien'
+    const { typeInscription } = req.body;
 
     if (!['nouveau', 'ancien'].includes(typeInscription)) {
       return res.status(400).json({ success: false, error: 'typeInscription doit être "nouveau" ou "ancien"' });
@@ -833,7 +892,7 @@ export const setTypeInscription = async (req, res) => {
 
     res.json({
       success: true,
-      message: `Membre marqué comme "${typeInscription}" — inscription à ${typeInscription === 'ancien' ? COTISATIONS.inscriptionAncien : COTISATIONS.inscriptionNouveau} FCFA`,
+      message: `Membre marqué comme "${typeInscription}"`,
       data: { _id: membre._id, nom: membre.nom, prenom: membre.prenom, typeInscription: membre.typeInscription }
     });
   } catch (error) {
@@ -848,6 +907,9 @@ export default {
   deleteTransaction,
   getExpenses,
   addExpense,
+  modifierDepense,
+  approuverDepense,
+  effectuerVirement,
   getSoldes,
   getFinancialStats,
   sendRappel,

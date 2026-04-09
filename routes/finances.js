@@ -7,13 +7,16 @@ import {
   deleteTransaction,
   getExpenses,
   addExpense,
+  modifierDepense,
+  approuverDepense,
   getSoldes,
   getFinancialStats,
   sendRappel,
   sendMassRappels,
   generateFinancialReport,
   getMemberStatement,
-  setTypeInscription       // ✅ nouveau
+  setTypeInscription,
+  effectuerVirement
 } from '../controllers/financesController.js';
 import { protect, admin } from '../middleware/auth.js';
 
@@ -25,20 +28,25 @@ router.use(protect);
 // ── Transactions ──────────────────────────────────────────
 router.get('/transactions',        getTransactions);
 router.post('/transactions',       addTransaction);
-router.put('/transactions/:id',    admin, updateTransaction);   // ✅ admin en une seule fois
-router.delete('/transactions/:id', admin, deleteTransaction);   // ✅ supprimé le doublon
+router.put('/transactions/:id',    admin, updateTransaction);
+router.delete('/transactions/:id', admin, deleteTransaction);
 
 // ── Dépenses ─────────────────────────────────────────────
-router.get('/depenses',  getExpenses);
-router.post('/depenses', addExpense);
+router.get('/depenses',           getExpenses);
+router.post('/depenses',          addExpense);
+router.put('/depenses/:id',       admin, modifierDepense);
+router.put('/depenses/:id/approuver', admin, approuverDepense);
+
+// ── Virement ─────────────────────────────────────────────
+router.post('/virement', admin, effectuerVirement);
 
 // ── Caisses & Statistiques ───────────────────────────────
 router.get('/soldes', getSoldes);
 router.get('/stats',  getFinancialStats);
 
 // ── Rappels ──────────────────────────────────────────────
-router.post('/rappels/masse',       sendMassRappels);   // ✅ /masse avant /:membreId
-router.post('/rappels/:membreId',   sendRappel);
+router.post('/rappels/masse',     sendMassRappels);
+router.post('/rappels/:membreId', sendRappel);
 
 // ── Rapports ─────────────────────────────────────────────
 router.get('/rapport',       generateFinancialReport);
