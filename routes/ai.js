@@ -1,4 +1,4 @@
-// backend/routes/ai.js
+// backend/routes/ai.js - VERSION ULTIME COMPLÈTE
 import express from 'express';
 import { body, param, validationResult } from 'express-validator';
 import { protect } from '../middleware/auth.js';
@@ -6,20 +6,22 @@ import { aiService } from '../services/aiService.js';
 import Activite from '../models/Activite.js';
 import Jalon from '../models/Jalon.js';
 import Ressource from '../models/Ressource.js';
+import Membre from '../models/Membre.js';
+import { Transaction, Expense, Caisse } from '../models/Finance.js';
 import logger from '../utils/logger.js';
 
 const router = express.Router();
 router.use(protect);
 
 // ──────────────────────────────────────────────────────────────
-// GET /api/ai/status - Vérifier la configuration IA
+// GET /api/ai/status - Vérifier la configuration IA (ULTIME)
 // ──────────────────────────────────────────────────────────────
 router.get('/status', (_req, res) => {
   res.json({ 
     success: true, 
     disponible: aiService.isConfigured(), 
     modele: 'DeepSeek Chat',
-    version: '2.0.0',
+    version: '3.0.0-ultime',
     fonctions: [
       'optimisation_planning',
       'redaction_messages',
@@ -27,7 +29,12 @@ router.get('/status', (_req, res) => {
       'analyse_critique',
       'reallocation_ressources',
       'planification_jalons',
-      'redaction_compte_rendu'
+      'redaction_compte_rendu',
+      'analyse_finances',
+      'detection_membres_risque',
+      'planification_activites',
+      'rapport_narratif',
+      'chat_contextuel'
     ]
   });
 });
@@ -52,10 +59,7 @@ router.post('/analyser/:id',
         return res.status(404).json({ success: false, message: 'Activité introuvable' });
       }
 
-      // Récupérer les jalons associés
       const jalons = await Jalon.find({ activiteId: act._id });
-      
-      // Récupérer les ressources associées
       const ressources = await Ressource.find({ activiteId: act._id });
 
       const analyse = await aiService.analyserActivite({
@@ -132,7 +136,6 @@ router.post('/analyser-critique', async (req, res) => {
   try {
     const { activites, jalons, ressources } = req.body;
     
-    // Si pas de données fournies, récupérer depuis la base
     let activitesData = activites;
     let jalonsData = jalons;
     let ressourcesData = ressources;
@@ -223,7 +226,6 @@ router.post('/planifier-jalons/:id',
         return res.status(503).json({ success: false, message: 'IA non disponible' });
       }
       
-      // Optionnel: Créer automatiquement les jalons
       const autoCreate = req.body.autoCreate === true;
       const jalonsCrees = [];
       
@@ -329,7 +331,6 @@ router.get('/suggestions', async (req, res) => {
     
     const suggestions = [];
     
-    // Suggestions basées sur les activités
     for (const act of activites) {
       const daysLeft = Math.ceil((new Date(act.dateFin) - new Date()) / 86400000);
       if (daysLeft <= 3 && act.progression < 50) {
@@ -341,7 +342,6 @@ router.get('/suggestions', async (req, res) => {
       }
     }
     
-    // Suggestions IA avancées si disponible
     let iaSuggestions = null;
     if (aiService.isConfigured() && activites.length > 0) {
       iaSuggestions = await aiService.optimiserPlanning(activites.slice(0, 5));
@@ -359,6 +359,256 @@ router.get('/suggestions', async (req, res) => {
   } catch (err) { 
     logger.error('Erreur GET /ai/suggestions:', err);
     res.status(500).json({ success: false, message: err.message }); 
+  }
+});
+
+// ============================================================
+// 🆕 ROUTES ULTIMES - SYNCHRONISATION COMPLÈTE
+// ============================================================
+
+// ──────────────────────────────────────────────────────────────
+// POST /api/ai/analyser-finances - Analyse financière intelligente
+// ──────────────────────────────────────────────────────────────
+router.post('/analyser-finances',
+  body('stats').optional(),
+  body('annee').optional().isInt({ min: 2020, max: 2030 }),
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      const { stats, annee = new Date().getFullYear() } = req.body;
+      
+      let financeData = stats;
+      if (!financeData) {
+        // Récupérer les données depuis la base
+        const transactions = await Transaction.find({ annee });
+        const depenses = await Expense.find({ annee });
+        const caisses = await Caisse.find();
+        const membres = await Membre.find({ actif: true });
+        
+        financeData = {
+          annee,
+          totalCotisations: transactions.filter(t => t.type === 'cotisation').reduce((s, t) => s + t.montant, 0),
+          totalSanctions: transactions.filter(t => t.type === 'sanction').reduce((s, t) => s + t.montant, 0),
+          totalDepenses: depenses.reduce((s, d) => s + d.montant, 0),
+          totalMembres: membres.length,
+          transactions,
+          depenses,
+          caisses
+        };
+      }
+      
+      const analyse = await aiService.analyserFinances(financeData, annee);
+      
+      res.json({ success: true, data: analyse });
+    } catch (err) {
+      logger.error('Erreur POST /ai/analyser-finances:', err);
+      res.status(500).json({ success: false, message: err.message });
+    }
+  }
+);
+
+// ──────────────────────────────────────────────────────────────
+// POST /api/ai/detecter-risques - Détection des membres à risque
+// ──────────────────────────────────────────────────────────────
+router.post('/detecter-risques',
+  body('membres').optional().isArray(),
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      let { membres } = req.body;
+      
+      if (!membres) {
+        membres = await Membre.find({ actif: true }).lean();
+      }
+      
+      const membresARisque = await aiService.detecterMembresARisque(membres);
+      
+      res.json({ 
+        success: true, 
+        data: membresARisque,
+        count: membresARisque.length 
+      });
+    } catch (err) {
+      logger.error('Erreur POST /ai/detecter-risques:', err);
+      res.status(500).json({ success: false, message: err.message });
+    }
+  }
+);
+
+// ──────────────────────────────────────────────────────────────
+// POST /api/ai/planifier-activites - Planification optimisée
+// ──────────────────────────────────────────────────────────────
+router.post('/planifier-activites',
+  body('activites').optional().isArray(),
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      let { activites } = req.body;
+      
+      if (!activites) {
+        activites = await Activite.find({ 
+          statut: { $nin: ['termine', 'annule'] } 
+        }).populate('responsables', 'nom prenom').lean();
+      }
+      
+      const planning = await aiService.planifierActivites(activites);
+      
+      res.json({ success: true, data: planning });
+    } catch (err) {
+      logger.error('Erreur POST /ai/planifier-activites:', err);
+      res.status(500).json({ success: false, message: err.message });
+    }
+  }
+);
+
+// ──────────────────────────────────────────────────────────────
+// POST /api/ai/rapport-narratif - Génération de rapport narratif
+// ──────────────────────────────────────────────────────────────
+router.post('/rapport-narratif',
+  body('periode').optional().isString(),
+  body('sections').optional().isArray(),
+  body('ton').optional().isIn(['professionnel', 'formel', 'motivationnel']),
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      const { 
+        periode = '2026', 
+        sections = ['resume', 'finances', 'activites', 'membres', 'recommandations'], 
+        ton = 'professionnel' 
+      } = req.body;
+      
+      const annee = parseInt(periode) || new Date().getFullYear();
+      
+      // Récupérer toutes les données nécessaires
+      const [transactions, depenses, caisses, membres, activites] = await Promise.all([
+        Transaction.find({ annee }).populate('membreId', 'nom prenom').lean(),
+        Expense.find({ annee }).lean(),
+        Caisse.find().lean(),
+        Membre.find({ actif: true }).lean(),
+        Activite.find({ 
+          $or: [
+            { dateDebut: { $gte: new Date(annee, 0, 1), $lte: new Date(annee, 11, 31) } },
+            { dateFin: { $gte: new Date(annee, 0, 1), $lte: new Date(annee, 11, 31) } }
+          ]
+        }).lean()
+      ]);
+      
+      const rapport = await aiService.genererRapportNarratif({
+        periode,
+        sections,
+        ton,
+        data: {
+          finances: { transactions, depenses, caisses },
+          membres,
+          activites
+        }
+      });
+      
+      res.json({ success: true, data: rapport });
+    } catch (err) {
+      logger.error('Erreur POST /ai/rapport-narratif:', err);
+      res.status(500).json({ success: false, message: err.message });
+    }
+  }
+);
+
+// ──────────────────────────────────────────────────────────────
+// POST /api/ai/chat - Assistant conversationnel contextuel
+// ──────────────────────────────────────────────────────────────
+router.post('/chat',
+  body('question').notEmpty().withMessage('Question requise'),
+  body('contexte').optional(),
+  body('historique').optional().isArray(),
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      const { question, contexte = {}, historique = [] } = req.body;
+      
+      // Enrichir le contexte avec des données fraîches si nécessaire
+      let contexteEnrichi = { ...contexte };
+      
+      if (contexte.module === 'finances') {
+        const annee = new Date().getFullYear();
+        const [transactions, depenses] = await Promise.all([
+          Transaction.find({ annee }).limit(50).lean(),
+          Expense.find({ annee }).limit(20).lean()
+        ]);
+        contexteEnrichi.finances = { transactions, depenses };
+      } else if (contexte.module === 'membres') {
+        const membres = await Membre.find({ actif: true }).limit(30).lean();
+        contexteEnrichi.membres = membres;
+      } else if (contexte.module === 'activites') {
+        const activites = await Activite.find({ 
+          statut: { $nin: ['termine', 'annule'] } 
+        }).limit(20).lean();
+        contexteEnrichi.activites = activites;
+      }
+      
+      const reponse = await aiService.chatContextuel(question, contexteEnrichi, historique);
+      
+      res.json({ success: true, data: reponse });
+    } catch (err) {
+      logger.error('Erreur POST /ai/chat:', err);
+      res.status(500).json({ success: false, message: err.message });
+    }
+  }
+);
+
+// ──────────────────────────────────────────────────────────────
+// GET /api/ai/quick-analyse - Analyse rapide pour dashboard
+// ──────────────────────────────────────────────────────────────
+router.get('/quick-analyse', async (req, res) => {
+  try {
+    const [activites, membres, transactions] = await Promise.all([
+      Activite.find({ statut: { $nin: ['termine', 'annule'] } }).limit(10).lean(),
+      Membre.countDocuments({ actif: true }),
+      Transaction.find({ annee: new Date().getFullYear() }).lean()
+    ]);
+    
+    const totalCollecte = transactions.reduce((s, t) => s + t.montant, 0);
+    const urgences = activites.filter(a => {
+      const days = Math.ceil((new Date(a.dateFin) - new Date()) / 86400000);
+      return days <= 7 && a.progression < 70;
+    });
+    
+    let analyseIA = null;
+    if (aiService.isConfigured() && urgences.length > 0) {
+      analyseIA = await aiService.optimiserPlanning(urgences.slice(0, 3));
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        activitesEnCours: activites.length,
+        totalMembres: membres,
+        totalCollecte,
+        urgences: urgences.length,
+        analyseIA
+      }
+    });
+  } catch (err) {
+    logger.error('Erreur GET /ai/quick-analyse:', err);
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
