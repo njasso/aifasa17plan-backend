@@ -156,6 +156,8 @@ import jalonRoutes from './routes/jalons.js';
 import ressourceRoutes from './routes/ressources.js';
 import webhookRoutes from './routes/webhook.js';
 import financesRoutes from './routes/finances.js';
+import sanctionsRoutes from './routes/sanctions.js';
+
 
 app.use('/api/auth', authRoutes);
 app.use('/api/members', memberRoutes);
@@ -173,6 +175,7 @@ app.use('/api/jalons', jalonRoutes);
 app.use('/api/ressources', ressourceRoutes);
 app.use('/api/webhook', webhookRoutes);
 app.use('/api/finances', financesRoutes);
+app.use('/api/sanctions', sanctionsRoutes);
 
 // ============================================================
 // ❤️ HEALTH CHECK (IMPORTANT RENDER)
